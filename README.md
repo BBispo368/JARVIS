@@ -1,12 +1,12 @@
-# J.A.R.V.I.S. — Fases 1 e 2
+# J.A.R.V.I.S.
 
-Assistente de voz pessoal para Android. Você toca no orb e fala. O app transcreve em pt-BR, manda o texto para o Claude e lê a resposta em voz alta. No **modo conversa**, ele volta a ouvir sozinho quando termina de falar.
+Assistente de voz pessoal para Android. Você toca no orb e fala. O app transcreve em pt-BR, manda o texto para a IA (**Google Gemini, grátis**, ou Claude) e lê a resposta em voz alta. No **modo conversa**, ele volta a ouvir sozinho quando termina de falar.
 
 Na **Fase 2**, o Jarvis também **age**: usa ferramentas no celular (timer, alarme, lanterna) e no seu computador, por meio de um agente pequeno que roda no PC (abrir sites e apps, controlar mídia e volume, bloquear a tela, copiar texto, rodar atalhos que você define).
 
 - Kotlin + Jetpack Compose (Material 3), minSdk 26, target/compileSdk 35
 - Voz: `SpeechRecognizer` e `TextToSpeech` nativos do Android
-- API: Claude Messages API via OkHttp + `org.json`
+- IA: Gemini (`streamGenerateContent`) ou Claude (Messages API), via OkHttp + `org.json`
 
 ## Estrutura
 
@@ -16,6 +16,8 @@ app/src/main/java/dev/breno/jarvis/
 ├── JarvisViewModel.kt       # estado (StateFlow), histórico, ciclo ouvir → pensar → falar
 ├── model/ChatMessage.kt     # Role, ChatMessage, JarvisStatus, JarvisUiState
 ├── api/ClaudeClient.kt      # chamada à Messages API em streaming (SSE)
+├── api/GeminiClient.kt      # chamada ao Gemini em streaming (SSE)
+├── api/GeminiFormat.kt      # tradução formato interno ↔ Gemini (thought signatures)
 ├── api/StreamAccumulator.kt # remonta a resposta a partir dos eventos SSE
 ├── agent/
 │   ├── JarvisAgent.kt       # loop de tool calling (tool_use → tool_result → resposta)
@@ -40,9 +42,23 @@ pc-agent/
 └── test_jarvis_agent.py     # testes do agente
 ```
 
-## 1. Configurar a API key
+## 1. Configurar a IA
 
-Crie uma chave em <https://console.anthropic.com/settings/keys>. Há dois jeitos de colocá-la no app:
+O padrão é o **Google Gemini**, que tem plano gratuito:
+
+1. Entre em <https://aistudio.google.com/apikey> com a sua conta Google (não precisa de cartão) e crie uma chave.
+2. No app, toque em **Ajustes**, escolha **Gemini (grátis)**, cole a chave e salve.
+3. O modelo padrão é `gemini-3.8-flash`. Se ficar lento ou estourar o limite, troque em Ajustes por `gemini-3.6-flash` ou `gemini-3.5-flash-lite`.
+
+Sobre o plano gratuito do Gemini:
+- Tem limite de pedidos por minuto e por dia. Os números ficam no painel do AI Studio. Quando passa do limite, o Jarvis avisa "Limite gratuito do Gemini atingido" e volta a funcionar depois de um tempo.
+- O Google pode usar as conversas do plano gratuito para melhorar os produtos dele. Não fale nada sensível.
+
+Para usar o **Claude**: a assinatura do claude.ai **não** inclui acesso à API. É preciso uma chave do Console da Anthropic (<https://console.anthropic.com/settings/keys>), que cobra por uso. Em Ajustes, escolha **Claude** e cole a chave.
+
+Trocar de IA começa uma conversa nova, porque cada uma guarda o histórico num formato diferente.
+
+Há dois jeitos de configurar as chaves:
 
 - **Pelo app (mais fácil):** abra o Jarvis, toque em **Ajustes** (canto superior direito), cole a chave e salve. Não precisa recompilar. Na primeira vez sem chave, os Ajustes abrem sozinhos.
 - **Pelo `local.properties`:** vira o valor inicial embutido no APK, útil se você reinstala com frequência. O que você salvar em Ajustes tem prioridade.
@@ -185,6 +201,19 @@ Enquanto usa uma ferramenta, a tela mostra o que ele está fazendo ("Criando tim
 
 O celular e o PC precisam estar na **mesma rede Wi-Fi**.
 
+### Usar fora de casa (Tailscale)
+
+A busca automática só acha o PC na mesma rede Wi-Fi. Para o Jarvis controlar o PC quando você está no 4G ou em outra rede, use o **Tailscale**. É uma VPN privada entre os seus aparelhos, grátis para uso pessoal, sem mexer no roteador e com o tráfego criptografado.
+
+1. Crie uma conta em <https://tailscale.com> e instale o app **no PC e no celular**, entrando com a mesma conta nos dois.
+2. No painel do Tailscale, veja o nome do PC (ex.: `meu-pc`) ou o IP dele (`100.x.y.z`).
+3. No Jarvis: **Ajustes → Endereço do PC fora de casa (Tailscale)** → `http://meu-pc:8765`. Se o nome não funcionar, use `http://100.x.y.z:8765`.
+4. Deixe o Tailscale ligado no celular. Ele aparece como VPN; o Android só permite uma VPN por vez.
+
+O app tenta, nesta ordem: o endereço de casa, depois o endereço remoto, depois a busca na rede. Em casa ele usa o Wi-Fi direto; fora, o Tailscale.
+
+**Não abra a porta 8765 no roteador.** O tráfego entre celular e PC é HTTP sem criptografia. Pela internet aberta, o token poderia ser interceptado. Com o Tailscale, tudo vai dentro de um túnel criptografado.
+
 ### Configurar apps e atalhos
 
 Edite o `pc-agent/config.json`, usando o `config.example.json` como base, e reinicie o agente. O app pega as mudanças sozinho, **sem recompilar**, porque o PC anuncia as próprias ferramentas.
@@ -234,5 +263,7 @@ cd pc-agent && python -m unittest -v test_jarvis_agent.py
 - **"PC offline"**: o agente está rodando? Celular e PC estão no mesmo Wi-Fi? Teste no navegador do celular: `http://IP-DO-PC:8765/health` deve responder `{"ok": false, "error": "não autorizado"}`. Se não abrir, é rede ou firewall.
 - **"Procurar PC na rede" não acha nada, mas o `/health` abre**: o roteador bloqueia broadcast. Digite o endereço manualmente em Ajustes.
 - **"token recusado pelo PC"**: o token em Ajustes não bate com o `token` do `pc-agent/config.json`.
+- **Fora de casa diz "PC offline"**: o Tailscale está ligado no celular e no PC? O PC aparece como conectado no app do Tailscale? No Windows, se o firewall bloquear a rede do Tailscale, permita o Python também em redes **públicas**, ou marque a rede do Tailscale como privada.
+- **"Limite gratuito do Gemini atingido"**: espere um minuto (limite por minuto) ou até o dia seguinte (limite diário), ou troque para um modelo mais leve em Ajustes.
 - **Redes de visitante ou corporativas** costumam bloquear a comunicação entre aparelhos ("isolamento de cliente"). Use a rede principal de casa.
 - **Timer ou alarme não aparece**: precisa de um app de relógio que aceite pedidos de outros apps (o Relógio do Google aceita).

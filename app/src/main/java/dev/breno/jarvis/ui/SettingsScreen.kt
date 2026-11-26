@@ -36,6 +36,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.breno.jarvis.model.DiscoveryState
 import dev.breno.jarvis.settings.JarvisSettings
+import dev.breno.jarvis.settings.Provider
 import dev.breno.jarvis.ui.theme.JarvisColors
 
 @Composable
@@ -46,9 +47,13 @@ fun SettingsScreen(
     onSave: (JarvisSettings) -> Unit,
     onCancel: () -> Unit,
 ) {
+    var provider by rememberSaveable { mutableStateOf(initial.provider) }
+    var geminiKey by rememberSaveable { mutableStateOf(initial.geminiKey) }
+    var geminiModel by rememberSaveable { mutableStateOf(initial.geminiModel) }
     var apiKey by rememberSaveable { mutableStateOf(initial.apiKey) }
     var model by rememberSaveable { mutableStateOf(initial.model) }
     var pcUrl by rememberSaveable { mutableStateOf(initial.pcUrl) }
+    var pcRemoteUrl by rememberSaveable { mutableStateOf(initial.pcRemoteUrl) }
     var pcToken by rememberSaveable { mutableStateOf(initial.pcToken) }
     var showSecrets by rememberSaveable { mutableStateOf(false) }
 
@@ -68,9 +73,32 @@ fun SettingsScreen(
     ) {
         Text("Ajustes", color = JarvisColors.Cyan, fontSize = 22.sp, letterSpacing = 4.sp)
 
-        Section("Claude")
-        Field("Chave da API", apiKey, { apiKey = it }, secret = !showSecrets)
-        Field("Modelo", model, { model = it })
+        Section("Inteligência")
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Provider.entries.forEach { p ->
+                val selected = p == provider
+                if (selected) {
+                    Button(
+                        onClick = { provider = p },
+                        colors = ButtonDefaults.buttonColors(containerColor = JarvisColors.Cyan),
+                    ) { Text(p.label, color = JarvisColors.Background) }
+                } else {
+                    OutlinedButton(onClick = { provider = p }) { Text(p.label) }
+                }
+            }
+        }
+        when (provider) {
+            Provider.GEMINI -> {
+                Hint("Crie uma chave grátis em aistudio.google.com/apikey (conta Google, sem cartão).")
+                Field("Chave do Gemini", geminiKey, { geminiKey = it }, secret = !showSecrets)
+                Field("Modelo do Gemini", geminiModel, { geminiModel = it })
+            }
+            Provider.CLAUDE -> {
+                Hint("Precisa de uma chave da API da Anthropic (console), separada da assinatura do claude.ai.")
+                Field("Chave da API do Claude", apiKey, { apiKey = it }, secret = !showSecrets)
+                Field("Modelo do Claude", model, { model = it })
+            }
+        }
 
         Section("Computador")
         Hint(
@@ -78,11 +106,13 @@ fun SettingsScreen(
                 "Com o token salvo, o app acha o PC na rede sozinho, mesmo se o IP mudar."
         )
         Field("Token do PC", pcToken, { pcToken = it }, secret = !showSecrets)
-        Field("Endereço do PC (opcional)", pcUrl, { pcUrl = it }, keyboard = KeyboardType.Uri)
+        Field("Endereço do PC em casa (opcional)", pcUrl, { pcUrl = it }, keyboard = KeyboardType.Uri)
         OutlinedButton(onClick = onDiscover, enabled = !discovery.searching) {
             Text(if (discovery.searching) "Procurando…" else "Procurar PC na rede")
         }
         discovery.message?.let { Hint(it) }
+        Hint("Fora de casa: instale o Tailscale no PC e no celular e coloque aqui o endereço dele, ex.: http://meu-pc:8765")
+        Field("Endereço do PC fora de casa (Tailscale)", pcRemoteUrl, { pcRemoteUrl = it }, keyboard = KeyboardType.Uri)
 
         TextButton(onClick = { showSecrets = !showSecrets }) {
             Text(if (showSecrets) "Ocultar chaves" else "Mostrar chaves", color = JarvisColors.TextMuted)
@@ -92,7 +122,20 @@ fun SettingsScreen(
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             OutlinedButton(onClick = onCancel) { Text("Cancelar") }
             Button(
-                onClick = { onSave(JarvisSettings(apiKey, model, pcUrl, pcToken)) },
+                onClick = {
+                    onSave(
+                        JarvisSettings(
+                            provider = provider,
+                            geminiKey = geminiKey,
+                            geminiModel = geminiModel,
+                            apiKey = apiKey,
+                            model = model,
+                            pcUrl = pcUrl,
+                            pcRemoteUrl = pcRemoteUrl,
+                            pcToken = pcToken,
+                        )
+                    )
+                },
                 colors = ButtonDefaults.buttonColors(containerColor = JarvisColors.Cyan),
             ) { Text("Salvar", color = JarvisColors.Background) }
         }

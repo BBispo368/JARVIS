@@ -33,6 +33,11 @@ android {
             "String", "CLAUDE_MODEL",
             localProp("CLAUDE_MODEL", "claude-sonnet-5-5").asBuildConfigString(),
         )
+        // IA padrão: "gemini" (grátis) ou "claude". Tudo isso também pode ser mudado em Ajustes no app.
+        buildConfigField("String", "JARVIS_PROVIDER", localProp("JARVIS_PROVIDER", "gemini").asBuildConfigString())
+        buildConfigField("String", "GEMINI_API_KEY", localProp("GEMINI_API_KEY").asBuildConfigString())
+        buildConfigField("String", "GEMINI_MODEL", localProp("GEMINI_MODEL", "gemini-3.8-flash").asBuildConfigString())
+        buildConfigField("String", "PC_AGENT_REMOTE_URL", localProp("PC_AGENT_REMOTE_URL").asBuildConfigString())
         // Agente do PC (Fase 2): ex. http://192.168.0.10:8765 e o token do pc-agent/config.json
         buildConfigField("String", "PC_AGENT_URL", localProp("PC_AGENT_URL").asBuildConfigString())
         buildConfigField("String", "PC_AGENT_TOKEN", localProp("PC_AGENT_TOKEN").asBuildConfigString())

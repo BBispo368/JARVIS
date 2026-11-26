@@ -51,7 +51,7 @@ data class JarvisUiState(
     val activity: String? = null,
     val pcStatus: PcStatus = PcStatus.NOT_CONFIGURED,
     val pcToolCount: Int = 0,
-    val settings: JarvisSettings = JarvisSettings("", "", "", ""),
+    val settings: JarvisSettings = JarvisSettings(),
     val showSettings: Boolean = false,
     val discovery: DiscoveryState = DiscoveryState(),
 )

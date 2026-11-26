@@ -5,8 +5,17 @@
 # sdk.dir=/Users/voce/Library/Android/sdk
 # sdk.dir=C\:\\Users\\voce\\AppData\\Local\\Android\\Sdk
 
+# Tudo abaixo é opcional: dá para configurar pelo app, em Ajustes.
+
+# IA padrão: gemini (grátis) ou claude
+JARVIS_PROVIDER=gemini
+
+# Chave grátis do Gemini (https://aistudio.google.com/apikey)
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-3.8-flash
+
 # Sua chave da API do Claude (https://console.anthropic.com/settings/keys)
-CLAUDE_API_KEY=sk-ant-...
+CLAUDE_API_KEY=
 
 # Modelo (opcional; padrão: claude-sonnet-5-5)
 CLAUDE_MODEL=claude-sonnet-5-5
@@ -14,5 +23,7 @@ CLAUDE_MODEL=claude-sonnet-5-5
 # --- Fase 2: agente no PC (pc-agent/) ---
 # Endereço do PC na rede local (mostrado quando você roda o jarvis_agent.py)
 PC_AGENT_URL=http://192.168.0.10:8765
+# Endereço do PC fora de casa (ex.: Tailscale: http://nome-do-pc:8765)
+PC_AGENT_REMOTE_URL=
 # Mesmo token do pc-agent/config.json
 PC_AGENT_TOKEN=

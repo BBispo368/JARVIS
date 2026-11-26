@@ -7,6 +7,7 @@ import dev.breno.jarvis.agent.ConversationHistory
 import dev.breno.jarvis.agent.JarvisAgent
 import dev.breno.jarvis.agent.JarvisTool
 import dev.breno.jarvis.api.ClaudeClient
+import dev.breno.jarvis.api.GeminiClient
 import dev.breno.jarvis.model.ChatMessage
 import dev.breno.jarvis.model.DiscoveryState
 import dev.breno.jarvis.model.JarvisStatus
@@ -16,6 +17,7 @@ import dev.breno.jarvis.model.Role
 import dev.breno.jarvis.pc.PcAgentClient
 import dev.breno.jarvis.pc.PcDiscovery
 import dev.breno.jarvis.settings.JarvisSettings
+import dev.breno.jarvis.settings.Provider
 import dev.breno.jarvis.settings.SettingsStore
 import dev.breno.jarvis.tools.PhoneTools
 import dev.breno.jarvis.voice.SentenceSplitter
@@ -48,7 +50,6 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     private val settings: JarvisSettings get() = _state.value.settings
 
     private var agent = newAgent(settings)
-    private var pc = PcAgentClient(settings.pcUrl, settings.pcToken)
     private val history = ConversationHistory(maxMessages = MAX_HISTORY)
     private val phoneTools: List<JarvisTool> = PhoneTools.all(application)
 
@@ -95,7 +96,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     )
 
     init {
-        if (settings.apiKey.isBlank()) {
+        if (settings.activeKey.isBlank()) {
             _state.update { it.copy(error = MISSING_KEY_ERROR, showSettings = true) }
         }
         refreshPcTools()
@@ -145,20 +146,27 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
 
     fun saveSettings(new: JarvisSettings) {
         val clean = new.copy(
+            geminiKey = new.geminiKey.trim(),
+            geminiModel = new.geminiModel.trim().ifBlank { JarvisSettings.DEFAULT_GEMINI_MODEL },
             apiKey = new.apiKey.trim(),
             model = new.model.trim().ifBlank { BuildConfig.CLAUDE_MODEL },
             pcUrl = new.pcUrl.trim().trimEnd('/'),
+            pcRemoteUrl = new.pcRemoteUrl.trim().trimEnd('/'),
             pcToken = new.pcToken.trim(),
         )
+        // Cada provedor tem seu formato de histórico: trocar de IA começa uma conversa nova.
+        if (clean.provider != settings.provider || clean.activeModel() != settings.activeModel()) {
+            history.clear()
+            _state.update { it.copy(messages = emptyList()) }
+        }
         settingsStore.save(clean)
         agent = newAgent(clean)
-        pc = PcAgentClient(clean.pcUrl, clean.pcToken)
         pcTools = emptyList()
         pcJob?.cancel()
         _state.update {
             it.copy(
                 settings = clean,
-                error = if (clean.apiKey.isBlank()) MISSING_KEY_ERROR else null,
+                error = if (clean.activeKey.isBlank()) MISSING_KEY_ERROR else null,
             )
         }
         closeSettings()
@@ -194,8 +202,10 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     // ------------------------------------------------------------------ PC
 
     /**
-     * Busca (de novo) as ferramentas do PC. Se o endereço salvo não responder,
-     * procura o PC na rede e, achando, salva o endereço novo sozinho.
+     * Busca (de novo) as ferramentas do PC, nesta ordem:
+     *  1. endereço da rede de casa;
+     *  2. endereço remoto (ex.: Tailscale), para quando você está fora;
+     *  3. busca por broadcast na rede atual, que atualiza o endereço de casa se o IP mudou.
      */
     fun refreshPcTools() {
         if (settings.pcToken.isBlank()) {
@@ -206,14 +216,22 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
         if (pcJob?.isActive == true) return
         if (pcTools.isEmpty()) _state.update { it.copy(pcStatus = PcStatus.CHECKING) }
         pcJob = viewModelScope.launch {
-            var tools = if (pc.isConfigured) tryFetch(pc) else null
+            val token = settings.pcToken
+            val known = listOf(settings.pcUrl, settings.pcRemoteUrl).filter { it.isNotBlank() }.distinct()
+            var tools: List<JarvisTool>? = null
+            for (url in known) {
+                val client = PcAgentClient(url, token)
+                if (!client.isConfigured) continue
+                tools = tryFetch(client)
+                if (tools != null) break
+            }
             if (tools == null) {
                 for (found in runCatching { PcDiscovery.discover() }.getOrDefault(emptyList())) {
-                    if (found.url == settings.pcUrl) continue
-                    val candidate = PcAgentClient(found.url, settings.pcToken)
+                    if (found.url in known) continue
+                    val candidate = PcAgentClient(found.url, token)
                     tools = tryFetch(candidate)
                     if (tools != null) {
-                        pc = candidate
+                        // O IP de casa mudou: guarda o novo (o endereço remoto nunca é trocado).
                         val updated = settings.copy(pcUrl = found.url)
                         settingsStore.save(updated)
                         _state.update { it.copy(settings = updated) }
@@ -239,7 +257,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     // --------------------------------------------------------------- turno
 
     private fun startListening() {
-        if (settings.apiKey.isBlank()) {
+        if (settings.activeKey.isBlank()) {
             goIdle(error = MISSING_KEY_ERROR)
             return
         }
@@ -307,7 +325,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
             } catch (e: Exception) {
                 speaker.stop()
                 removeTurnMessages()
-                goIdle(error = e.message ?: "Falha ao falar com o Claude.")
+                goIdle(error = e.message ?: "Falha ao falar com a IA.")
             } finally {
                 refreshPcTools()
             }
@@ -373,9 +391,16 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
 
     companion object {
         private const val MAX_HISTORY = 20
-        private const val MISSING_KEY_ERROR = "Chave da API vazia. Toque em Ajustes e cole sua chave."
+        private const val MISSING_KEY_ERROR = "Chave da IA vazia. Toque em Ajustes e cole sua chave."
 
-        private fun newAgent(s: JarvisSettings) = JarvisAgent(ClaudeClient(apiKey = s.apiKey, model = s.model))
+        private fun JarvisSettings.activeModel() = if (provider == Provider.GEMINI) geminiModel else model
+
+        private fun newAgent(s: JarvisSettings) = JarvisAgent(
+            when (s.provider) {
+                Provider.GEMINI -> GeminiClient(apiKey = s.geminiKey, model = s.geminiModel)
+                Provider.CLAUDE -> ClaudeClient(apiKey = s.apiKey, model = s.model)
+            }
+        )
 
         private const val SYSTEM_PROMPT =
             "Você é o Jarvis, assistente pessoal do Breno. Responda sempre em português do Brasil, " +
