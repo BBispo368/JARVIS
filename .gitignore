@@ -15,3 +15,5 @@ captures/
 .idea/
 *.iml
 .DS_Store
+pc-agent/config.json
+__pycache__/

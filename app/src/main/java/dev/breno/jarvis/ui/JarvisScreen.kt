@@ -1,6 +1,7 @@
 package dev.breno.jarvis.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,10 +13,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
@@ -34,6 +38,7 @@ import androidx.compose.ui.unit.sp
 import dev.breno.jarvis.model.ChatMessage
 import dev.breno.jarvis.model.JarvisStatus
 import dev.breno.jarvis.model.JarvisUiState
+import dev.breno.jarvis.model.PcStatus
 import dev.breno.jarvis.model.Role
 import dev.breno.jarvis.ui.theme.JarvisColors
 import dev.breno.jarvis.ui.theme.JarvisTheme
@@ -43,6 +48,7 @@ fun JarvisScreen(
     state: JarvisUiState,
     onOrbTap: () -> Unit,
     onConversationModeChange: (Boolean) -> Unit,
+    onPcStatusTap: () -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -58,8 +64,9 @@ fun JarvisScreen(
             fontSize = 26.sp,
             fontWeight = FontWeight.Light,
             letterSpacing = 8.sp,
-            modifier = Modifier.padding(top = 16.dp, bottom = 8.dp),
+            modifier = Modifier.padding(top = 16.dp, bottom = 2.dp),
         )
+        PcIndicator(status = state.pcStatus, toolCount = state.pcToolCount, onClick = onPcStatusTap)
 
         MessageList(messages = state.messages, modifier = Modifier.weight(1f).fillMaxWidth())
 
@@ -138,7 +145,7 @@ private fun StatusText(state: JarvisUiState) {
     val status = when (state.status) {
         JarvisStatus.IDLE -> "Toque para falar"
         JarvisStatus.LISTENING -> "Ouvindo…"
-        JarvisStatus.THINKING -> "Pensando…"
+        JarvisStatus.THINKING -> state.activity?.let { "$it…" } ?: "Pensando…"
         JarvisStatus.SPEAKING -> "Falando… (toque pra interromper)"
     }
     Column(
@@ -170,6 +177,27 @@ private fun StatusText(state: JarvisUiState) {
     }
 }
 
+@Composable
+private fun PcIndicator(status: PcStatus, toolCount: Int, onClick: () -> Unit) {
+    val (color, text) = when (status) {
+        PcStatus.NOT_CONFIGURED -> JarvisColors.TextMuted to "PC não configurado"
+        PcStatus.CHECKING -> JarvisColors.Amber to "Procurando o PC…"
+        PcStatus.ONLINE -> JarvisColors.Cyan to "PC conectado · $toolCount ferramentas"
+        PcStatus.OFFLINE -> JarvisColors.Error to "PC offline · toque para tentar de novo"
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 4.dp),
+    ) {
+        Box(Modifier.size(7.dp).clip(CircleShape).background(color))
+        Spacer(Modifier.width(6.dp))
+        Text(text, color = JarvisColors.TextMuted, fontSize = 12.sp)
+    }
+}
+
 @Preview(showBackground = true, backgroundColor = 0xFF05080F)
 @Composable
 private fun JarvisScreenPreview() {
@@ -184,6 +212,7 @@ private fun JarvisScreenPreview() {
             ),
             onOrbTap = {},
             onConversationModeChange = {},
+            onPcStatusTap = {},
         )
     }
 }

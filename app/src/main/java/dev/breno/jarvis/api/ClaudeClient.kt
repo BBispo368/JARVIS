@@ -1,6 +1,5 @@
 package dev.breno.jarvis.api
 
-import dev.breno.jarvis.model.ChatMessage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -18,9 +17,8 @@ class ClaudeException(message: String, cause: Throwable? = null) : Exception(mes
 /**
  * Resposta já decodificada da Messages API.
  *
- * [content] guarda os blocos crus pra Fase 2: com tool calling, o histórico
- * precisa reenviar exatamente esses blocos (text, tool_use, thinking...) como
- * conteúdo da mensagem "assistant".
+ * [content] são os blocos crus (text, tool_use, thinking...). No loop de
+ * ferramentas eles voltam para a API exatamente como vieram.
  */
 data class ClaudeResponse(
     val text: String,
@@ -28,43 +26,22 @@ data class ClaudeResponse(
     val content: JSONArray,
 )
 
-/**
- * Cliente mínimo da Messages API (POST /v1/messages) com OkHttp + org.json.
- *
- * Fase 2: o parâmetro [tools] de [createMessage] já existe; o loop de
- * tool_use → tool_result vai morar numa camada acima (agente), usando
- * [ClaudeResponse.content] e [ClaudeResponse.stopReason].
- */
+/** Abstração da chamada, para o agente poder ser testado com um cliente falso. */
+fun interface MessagesApi {
+    suspend fun createMessage(system: String, messages: JSONArray, tools: JSONArray?): ClaudeResponse
+}
+
+/** Cliente mínimo da Messages API (POST /v1/messages) com OkHttp + org.json. */
 class ClaudeClient(
     private val apiKey: String,
     private val model: String,
     private val http: OkHttpClient = defaultHttpClient(),
-) {
+) : MessagesApi {
 
-    /** Conveniência da Fase 1: histórico simples de texto → texto da resposta. */
-    suspend fun reply(system: String, history: List<ChatMessage>): String {
-        val messages = JSONArray()
-        history.forEach { msg ->
-            messages.put(JSONObject().put("role", msg.role.apiName).put("content", msg.text))
-        }
-        val response = createMessage(system = system, messages = messages)
-        if (response.text.isNotBlank()) return response.text
-        return when (response.stopReason) {
-            "refusal" -> "Receio que isso eu não possa responder, senhor."
-            "max_tokens" -> "Minha resposta ficou longa demais e foi cortada, senhor."
-            else -> throw ClaudeException("A API respondeu sem texto (stop_reason=${response.stopReason}).")
-        }
-    }
-
-    /**
-     * Chamada genérica. [messages] segue o formato da API (role + content,
-     * onde content pode ser string ou array de blocos).
-     */
-    suspend fun createMessage(
+    override suspend fun createMessage(
         system: String,
         messages: JSONArray,
-        tools: JSONArray? = null,
-        maxTokens: Int = DEFAULT_MAX_TOKENS,
+        tools: JSONArray?,
     ): ClaudeResponse = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) {
             throw ClaudeException("CLAUDE_API_KEY não configurada no local.properties.")
@@ -72,9 +49,17 @@ class ClaudeClient(
 
         val body = JSONObject().apply {
             put("model", model)
-            put("max_tokens", maxTokens)
+            put("max_tokens", MAX_TOKENS)
             put("system", system)
             put("messages", messages)
+            put(
+                "thinking",
+                JSONObject()
+                    .put("type", "adaptive")
+                    // Rede de segurança: se algum bloco de thinking não bater com o histórico,
+                    // a API descarta o bloco em vez de responder 400.
+                    .put("block_binding", JSONObject().put("prefix_mismatch_behavior", "drop_block")),
+            )
             // Respostas curtas e faladas: pouco raciocínio = menos latência.
             put("output_config", JSONObject().put("effort", "low"))
             // Se o classificador de segurança recusar, o servidor tenta outro modelo sozinho.
@@ -86,7 +71,7 @@ class ClaudeClient(
             .url(API_URL)
             .header("x-api-key", apiKey)
             .header("anthropic-version", API_VERSION)
-            .header("anthropic-beta", FALLBACK_BETA)
+            .header("anthropic-beta", BETAS)
             .header("content-type", "application/json")
             .post(body.toString().toRequestBody(JSON_MEDIA_TYPE))
             .build()
@@ -111,19 +96,8 @@ class ClaudeClient(
         }
 
         val content = json.optJSONArray("content") ?: JSONArray()
-        val text = buildString {
-            for (i in 0 until content.length()) {
-                val block = content.optJSONObject(i) ?: continue
-                // Ignora blocos thinking/tool_use: só o texto vai pra tela e pro TTS.
-                if (block.optString("type") == "text") {
-                    if (isNotEmpty()) append(' ')
-                    append(block.optString("text"))
-                }
-            }
-        }.trim()
-
         ClaudeResponse(
-            text = text,
+            text = extractText(content),
             stopReason = json.optString("stop_reason").takeIf { it.isNotEmpty() && it != "null" },
             content = content,
         )
@@ -132,13 +106,24 @@ class ClaudeClient(
     companion object {
         private const val API_URL = "https://api.anthropic.com/v1/messages"
         private const val API_VERSION = "2023-06-01"
-        private const val FALLBACK_BETA = "server-side-fallback-2026-07-01"
-        private const val DEFAULT_MAX_TOKENS = 4096
+        private const val BETAS = "server-side-fallback-2026-07-01,thinking-binding-controls-2026-08-01"
+        private const val MAX_TOKENS = 4096
         private val JSON_MEDIA_TYPE = "application/json".toMediaType()
 
         fun defaultHttpClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build()
+
+        /** Junta só os blocos "text" (thinking e tool_use não vão pra tela nem pro TTS). */
+        fun extractText(content: JSONArray): String = buildString {
+            for (i in 0 until content.length()) {
+                val block = content.optJSONObject(i) ?: continue
+                if (block.optString("type") == "text") {
+                    if (isNotEmpty()) append(' ')
+                    append(block.optString("text"))
+                }
+            }
+        }.trim()
     }
 }

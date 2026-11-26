@@ -1,0 +1,25 @@
+{
+  "host": "0.0.0.0",
+  "port": 8765,
+  "token": "TROQUE-POR-UM-TOKEN-LONGO-E-ALEATORIO",
+  "apps": {
+    "navegador": "start chrome",
+    "spotify": "start spotify:",
+    "vscode": "code",
+    "calculadora": "calc"
+  },
+  "shortcuts": {
+    "ip_publico": {
+      "description": "mostra o IP público da internet de casa",
+      "command": "curl -s https://api.ipify.org"
+    },
+    "desligar": {
+      "description": "desliga o computador em 1 minuto (irreversível)",
+      "command": "shutdown /s /t 60"
+    },
+    "cancelar_desligamento": {
+      "description": "cancela um desligamento agendado",
+      "command": "shutdown /a"
+    }
+  }
+}

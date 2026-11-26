@@ -20,6 +20,14 @@ enum class JarvisStatus {
     SPEAKING,
 }
 
+/** Conexão com o agente do PC. */
+enum class PcStatus {
+    NOT_CONFIGURED,
+    CHECKING,
+    ONLINE,
+    OFFLINE,
+}
+
 data class JarvisUiState(
     val status: JarvisStatus = JarvisStatus.IDLE,
     val messages: List<ChatMessage> = emptyList(),
@@ -29,4 +37,8 @@ data class JarvisUiState(
     val micLevel: Float = 0f,
     val conversationMode: Boolean = true,
     val error: String? = null,
+    /** O que o agente está fazendo agora ("Criando timer"...), durante o estado THINKING. */
+    val activity: String? = null,
+    val pcStatus: PcStatus = PcStatus.NOT_CONFIGURED,
+    val pcToolCount: Int = 0,
 )

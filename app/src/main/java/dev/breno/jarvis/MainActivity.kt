@@ -32,6 +32,7 @@ class MainActivity : ComponentActivity() {
                     state = state,
                     onOrbTap = ::onOrbTap,
                     onConversationModeChange = viewModel::setConversationMode,
+                    onPcStatusTap = viewModel::refreshPcTools,
                 )
             }
         }

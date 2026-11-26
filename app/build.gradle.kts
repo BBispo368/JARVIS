@@ -33,6 +33,9 @@ android {
             "String", "CLAUDE_MODEL",
             localProp("CLAUDE_MODEL", "claude-sonnet-5-5").asBuildConfigString(),
         )
+        // Agente do PC (Fase 2): ex. http://192.168.0.10:8765 e o token do pc-agent/config.json
+        buildConfigField("String", "PC_AGENT_URL", localProp("PC_AGENT_URL").asBuildConfigString())
+        buildConfigField("String", "PC_AGENT_TOKEN", localProp("PC_AGENT_TOKEN").asBuildConfigString())
     }
 
     buildTypes {
@@ -67,4 +70,9 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.tooling)
 
     implementation(libs.okhttp)
+
+    testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
+    // O org.json do Android vira stub nos testes JVM; este é o real.
+    testImplementation(libs.json)
 }
