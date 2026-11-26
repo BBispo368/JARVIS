@@ -8,9 +8,17 @@ import kotlinx.coroutines.coroutineScope
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Resultado de um turno: o texto a falar e as mensagens a guardar no histórico. */
+/**
+ * Resultado de um turno.
+ *
+ * [text] é tudo que o Jarvis disse no turno (inclusive frases antes de usar
+ * ferramentas, como "um momento"). [unstreamedTail] é a parte que NÃO chegou
+ * pelo streaming (ex.: a frase padrão de uma recusa) e ainda precisa ser
+ * falada. [messages] é o que vai pro histórico.
+ */
 data class TurnResult(
     val text: String,
+    val unstreamedTail: String,
     val messages: List<JSONObject>,
 )
 
@@ -32,6 +40,7 @@ class JarvisAgent(
         history: List<JSONObject>,
         userText: String,
         tools: List<JarvisTool>,
+        onTextDelta: suspend (String) -> Unit = {},
         onToolStart: (JarvisTool) -> Unit = {},
     ): TurnResult {
         val toolsByName = tools.associateBy { it.name }
@@ -39,21 +48,35 @@ class JarvisAgent(
 
         val turn = mutableListOf(JSONObject().put("role", "user").put("content", userText))
         val messages = JSONArray(history).also { arr -> turn.forEach { arr.put(it) } }
+        val spoken = StringBuilder()
 
         repeat(maxSteps) {
-            val response = api.createMessage(system, messages, toolsJson)
-            val toolUses = (0 until response.content.length())
-                .mapNotNull { response.content.optJSONObject(it) }
+            // Separa as falas de etapas diferentes ("Um momento." + "Pronto.").
+            val needsSpace = spoken.isNotEmpty()
+            var first = true
+            val response = api.createMessage(system, messages, toolsJson) { delta ->
+                val piece = if (first && needsSpace) " $delta" else delta
+                first = false
+                spoken.append(piece)
+                onTextDelta(piece)
+            }
+            val content = echoable(response.content)
+            val toolUses = (0 until content.length())
+                .mapNotNull { content.optJSONObject(it) }
                 .filter { it.optString("type") == "tool_use" }
 
             if (response.stopReason != "tool_use" || toolUses.isEmpty()) {
-                val text = response.text.ifBlank { fallbackText(response.stopReason) }
-                // A resposta final guardada no histórico só precisa do texto.
-                turn += assistantText(text)
-                return TurnResult(text, turn)
+                if (response.text.isNotBlank()) {
+                    // A resposta final guardada no histórico só precisa do texto.
+                    turn += assistantText(response.text)
+                    return TurnResult(spoken.toString().trim(), "", turn)
+                }
+                val tail = fallbackText(response.stopReason)
+                turn += assistantText(tail)
+                return TurnResult(join(spoken.toString(), tail), tail, turn)
             }
 
-            val assistant = JSONObject().put("role", "assistant").put("content", response.content)
+            val assistant = JSONObject().put("role", "assistant").put("content", content)
             turn += assistant
             messages.put(assistant)
 
@@ -66,9 +89,9 @@ class JarvisAgent(
             messages.put(toolResults)
         }
 
-        val text = "Desisti depois de etapas demais, senhor. Tente pedir de outro jeito."
-        turn += assistantText(text)
-        return TurnResult(text, turn)
+        val tail = "Desisti depois de etapas demais, senhor. Tente pedir de outro jeito."
+        turn += assistantText(tail)
+        return TurnResult(join(spoken.toString(), tail), tail, turn)
     }
 
     private suspend fun runTool(
@@ -96,6 +119,8 @@ class JarvisAgent(
             .apply { if (result.isError) put("is_error", true) }
     }
 
+    private fun join(a: String, b: String) = listOf(a.trim(), b.trim()).filter { it.isNotEmpty() }.joinToString(" ")
+
     private fun assistantText(text: String) = JSONObject()
         .put("role", "assistant")
         .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", text)))
@@ -104,5 +129,29 @@ class JarvisAgent(
         "refusal" -> "Receio que isso eu não possa responder, senhor."
         "max_tokens" -> "Minha resposta ficou longa demais e foi cortada, senhor."
         else -> "Fiquei sem palavras, senhor."
+    }
+
+    companion object {
+        private val DROP_BEFORE_FALLBACK = setOf("thinking", "redacted_thinking", "tool_use")
+
+        /**
+         * Se o servidor trocou de modelo no meio da resposta (bloco "fallback"),
+         * os blocos thinking/tool_use anteriores a ele não podem ser reenviados.
+         * O bloco fallback fica exatamente onde apareceu.
+         */
+        internal fun echoable(content: JSONArray): JSONArray {
+            var lastFallback = -1
+            for (i in 0 until content.length()) {
+                if (content.optJSONObject(i)?.optString("type") == "fallback") lastFallback = i
+            }
+            if (lastFallback < 0) return content
+            val out = JSONArray()
+            for (i in 0 until content.length()) {
+                val block = content.optJSONObject(i)
+                if (i < lastFallback && block?.optString("type") in DROP_BEFORE_FALLBACK) continue
+                out.put(content.get(i))
+            }
+            return out
+        }
     }
 }

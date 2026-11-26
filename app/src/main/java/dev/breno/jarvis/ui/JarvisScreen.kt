@@ -49,6 +49,7 @@ fun JarvisScreen(
     onOrbTap: () -> Unit,
     onConversationModeChange: (Boolean) -> Unit,
     onPcStatusTap: () -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -58,14 +59,26 @@ fun JarvisScreen(
             .padding(horizontal = 16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text(
-            text = "J.A.R.V.I.S.",
-            color = JarvisColors.Cyan,
-            fontSize = 26.sp,
-            fontWeight = FontWeight.Light,
-            letterSpacing = 8.sp,
-            modifier = Modifier.padding(top = 16.dp, bottom = 2.dp),
-        )
+        Box(Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 2.dp)) {
+            Text(
+                text = "J.A.R.V.I.S.",
+                color = JarvisColors.Cyan,
+                fontSize = 26.sp,
+                fontWeight = FontWeight.Light,
+                letterSpacing = 8.sp,
+                modifier = Modifier.align(Alignment.Center),
+            )
+            Text(
+                text = "Ajustes",
+                color = JarvisColors.TextMuted,
+                fontSize = 13.sp,
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable(onClick = onOpenSettings)
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+            )
+        }
         PcIndicator(status = state.pcStatus, toolCount = state.pcToolCount, onClick = onPcStatusTap)
 
         MessageList(messages = state.messages, modifier = Modifier.weight(1f).fillMaxWidth())
@@ -142,12 +155,13 @@ private fun MessageBubble(message: ChatMessage) {
 
 @Composable
 private fun StatusText(state: JarvisUiState) {
-    val status = when (state.status) {
-        JarvisStatus.IDLE -> "Toque para falar"
-        JarvisStatus.LISTENING -> "Ouvindo…"
-        JarvisStatus.THINKING -> state.activity?.let { "$it…" } ?: "Pensando…"
-        JarvisStatus.SPEAKING -> "Falando… (toque pra interromper)"
-    }
+    val status = state.activity?.takeIf { state.status != JarvisStatus.IDLE }?.let { "$it…" }
+        ?: when (state.status) {
+            JarvisStatus.IDLE -> "Toque para falar"
+            JarvisStatus.LISTENING -> "Ouvindo…"
+            JarvisStatus.THINKING -> "Pensando…"
+            JarvisStatus.SPEAKING -> "Falando… (toque pra interromper)"
+        }
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
@@ -213,6 +227,7 @@ private fun JarvisScreenPreview() {
             onOrbTap = {},
             onConversationModeChange = {},
             onPcStatusTap = {},
+            onOpenSettings = {},
         )
     }
 }

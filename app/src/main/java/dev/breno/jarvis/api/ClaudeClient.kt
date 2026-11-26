@@ -1,6 +1,9 @@
 package dev.breno.jarvis.api
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -11,6 +14,7 @@ import org.json.JSONException
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.coroutineContext
 
 class ClaudeException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
@@ -18,7 +22,7 @@ class ClaudeException(message: String, cause: Throwable? = null) : Exception(mes
  * Resposta já decodificada da Messages API.
  *
  * [content] são os blocos crus (text, tool_use, thinking...). No loop de
- * ferramentas eles voltam para a API exatamente como vieram.
+ * ferramentas eles voltam para a API como vieram.
  */
 data class ClaudeResponse(
     val text: String,
@@ -28,28 +32,40 @@ data class ClaudeResponse(
 
 /** Abstração da chamada, para o agente poder ser testado com um cliente falso. */
 fun interface MessagesApi {
-    suspend fun createMessage(system: String, messages: JSONArray, tools: JSONArray?): ClaudeResponse
+    /**
+     * Chama a API em streaming. [onTextDelta] recebe cada pedaço de texto assim
+     * que chega (para o TTS começar a falar antes da resposta terminar).
+     */
+    suspend fun createMessage(
+        system: String,
+        messages: JSONArray,
+        tools: JSONArray?,
+        onTextDelta: suspend (String) -> Unit,
+    ): ClaudeResponse
 }
 
-/** Cliente mínimo da Messages API (POST /v1/messages) com OkHttp + org.json. */
+/** Cliente mínimo da Messages API (POST /v1/messages, SSE) com OkHttp + org.json. */
 class ClaudeClient(
     private val apiKey: String,
     private val model: String,
     private val http: OkHttpClient = defaultHttpClient(),
+    private val apiUrl: String = API_URL,
 ) : MessagesApi {
 
     override suspend fun createMessage(
         system: String,
         messages: JSONArray,
         tools: JSONArray?,
+        onTextDelta: suspend (String) -> Unit,
     ): ClaudeResponse = withContext(Dispatchers.IO) {
         if (apiKey.isBlank()) {
-            throw ClaudeException("CLAUDE_API_KEY não configurada no local.properties.")
+            throw ClaudeException("Chave da API não configurada. Abra Ajustes e cole sua chave.")
         }
 
         val body = JSONObject().apply {
             put("model", model)
             put("max_tokens", MAX_TOKENS)
+            put("stream", true)
             put("system", system)
             put("messages", messages)
             put(
@@ -68,39 +84,61 @@ class ClaudeClient(
         }
 
         val request = Request.Builder()
-            .url(API_URL)
+            .url(apiUrl)
             .header("x-api-key", apiKey)
             .header("anthropic-version", API_VERSION)
             .header("anthropic-beta", BETAS)
-            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
             .post(body.toString().toRequestBody(JSON_MEDIA_TYPE))
             .build()
 
-        val (code, raw) = try {
-            http.newCall(request).execute().use { resp -> resp.code to resp.body.string() }
+        val call = http.newCall(request)
+        // A leitura do stream bloqueia a thread: cancelar a corrotina precisa cancelar a chamada HTTP.
+        val cancelHandle = coroutineContext[Job]?.invokeOnCompletion { cause -> if (cause != null) call.cancel() }
+        try {
+            call.execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    val raw = resp.body.string()
+                    val apiMessage = runCatching { JSONObject(raw).optJSONObject("error")?.optString("message") }
+                        .getOrNull().orEmpty()
+                    throw ClaudeException(
+                        if (apiMessage.isNotBlank()) "Erro da API (${resp.code}): $apiMessage"
+                        else "Erro da API (HTTP ${resp.code})."
+                    )
+                }
+
+                val acc = StreamAccumulator()
+                val source = resp.body.source()
+                var event = ""
+                val data = StringBuilder()
+                while (true) {
+                    coroutineContext.ensureActive()
+                    val line = source.readUtf8Line() ?: break
+                    when {
+                        line.startsWith("event:") -> event = line.substringAfter(':').trim()
+                        line.startsWith("data:") -> data.append(line.substringAfter(':').trimStart())
+                        line.isEmpty() && data.isNotEmpty() -> {
+                            val json = try {
+                                JSONObject(data.toString())
+                            } catch (e: JSONException) {
+                                throw ClaudeException("Evento inválido no streaming da API.", e)
+                            }
+                            val type = event.ifEmpty { json.optString("type") }
+                            acc.onEvent(type, json)?.let { onTextDelta(it) }
+                            event = ""
+                            data.clear()
+                            if (type == "message_stop") break
+                        }
+                    }
+                }
+                acc.result()
+            }
         } catch (e: IOException) {
+            if (call.isCanceled()) throw CancellationException("cancelado")
             throw ClaudeException("Falha de rede ao falar com a API: ${e.message ?: e.javaClass.simpleName}", e)
+        } finally {
+            cancelHandle?.dispose()
         }
-
-        val json = try {
-            JSONObject(raw)
-        } catch (e: JSONException) {
-            throw ClaudeException("Resposta inválida da API (HTTP $code).", e)
-        }
-
-        if (code !in 200..299) {
-            val apiMessage = json.optJSONObject("error")?.optString("message").orEmpty()
-            throw ClaudeException(
-                if (apiMessage.isNotBlank()) "Erro da API ($code): $apiMessage" else "Erro da API (HTTP $code)."
-            )
-        }
-
-        val content = json.optJSONArray("content") ?: JSONArray()
-        ClaudeResponse(
-            text = extractText(content),
-            stopReason = json.optString("stop_reason").takeIf { it.isNotEmpty() && it != "null" },
-            content = content,
-        )
     }
 
     companion object {

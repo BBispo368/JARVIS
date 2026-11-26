@@ -16,11 +16,22 @@ class JarvisAgentTest {
     /** Devolve respostas roteirizadas e guarda cópias das requisições. */
     private class FakeApi(private val responses: List<JSONArray>, private val stops: List<String>) : MessagesApi {
         val requests = mutableListOf<Triple<String, String, String?>>() // system, messages, tools
-        override suspend fun createMessage(system: String, messages: JSONArray, tools: JSONArray?): ClaudeResponse {
+        override suspend fun createMessage(
+            system: String,
+            messages: JSONArray,
+            tools: JSONArray?,
+            onTextDelta: suspend (String) -> Unit,
+        ): ClaudeResponse {
             val i = requests.size
             requests += Triple(system, messages.toString(), tools?.toString())
             val content = responses[i]
-            return ClaudeResponse(ClaudeClient.extractText(content), stops[i], content)
+            val text = ClaudeClient.extractText(content)
+            // Simula o streaming em dois pedaços.
+            if (text.isNotEmpty()) {
+                onTextDelta(text.take(text.length / 2))
+                onTextDelta(text.drop(text.length / 2))
+            }
+            return ClaudeResponse(text, stops[i], content)
         }
     }
 
@@ -40,9 +51,12 @@ class JarvisAgentTest {
     @Test
     fun `responde direto sem ferramentas`() = runTest {
         val api = FakeApi(listOf(JSONArray().put(text("Olá, senhor."))), listOf("end_turn"))
-        val result = JarvisAgent(api).runTurn("sys", emptyList(), "oi", emptyList())
+        val deltas = mutableListOf<String>()
+        val result = JarvisAgent(api).runTurn("sys", emptyList(), "oi", emptyList(), onTextDelta = { deltas += it })
 
         assertEquals("Olá, senhor.", result.text)
+        assertEquals("Olá, senhor.", deltas.joinToString(""))
+        assertEquals("", result.unstreamedTail)
         assertEquals(2, result.messages.size)
         assertEquals("user", result.messages[0].getString("role"))
         assertEquals(null, api.requests[0].third) // sem tools, o campo não vai
@@ -99,8 +113,43 @@ class JarvisAgentTest {
         val api = FakeApi(listOf(JSONArray().put(thinking())), listOf("refusal"))
         val result = JarvisAgent(api).runTurn("sys", emptyList(), "x", emptyList())
         assertTrue(result.text.isNotBlank())
+        assertEquals(result.text, result.unstreamedTail) // nada veio pelo streaming: precisa ser falado
         val last = result.messages.last().getJSONArray("content").getJSONObject(0)
         assertEquals("text", last.getString("type"))
+    }
+
+    @Test
+    fun `texto antes da ferramenta e depois sao falados com espaco entre eles`() = runTest {
+        val tool = FakeTool("pc_a", ToolResult.ok("ok"))
+        val api = FakeApi(
+            listOf(JSONArray().put(text("Um momento.")).put(toolUse("t1", "pc_a")), JSONArray().put(text("Pronto."))),
+            listOf("tool_use", "end_turn"),
+        )
+        val deltas = StringBuilder()
+        val result = JarvisAgent(api).runTurn("sys", emptyList(), "x", listOf(tool), onTextDelta = { deltas.append(it) })
+        assertEquals("Um momento. Pronto.", deltas.toString())
+        assertEquals("Um momento. Pronto.", result.text)
+    }
+
+    @Test
+    fun `apos fallback no meio da resposta nao reenvia thinking nem tool_use anteriores`() = runTest {
+        val tool = FakeTool("pc_b", ToolResult.ok("ok"))
+        val first = JSONArray()
+            .put(thinking())
+            .put(toolUse("velho", "pc_b"))
+            .put(JSONObject().put("type", "fallback").put("model", "outro"))
+            .put(thinking())
+            .put(toolUse("novo", "pc_b"))
+        val api = FakeApi(listOf(first, JSONArray().put(text("Feito."))), listOf("tool_use", "end_turn"))
+        JarvisAgent(api).runTurn("sys", emptyList(), "x", listOf(tool))
+
+        assertEquals(1, tool.inputs.size) // só o tool_use depois do fallback roda
+        val echoed = JSONArray(api.requests[1].second).getJSONObject(1).getJSONArray("content")
+        val types = (0 until echoed.length()).map { echoed.getJSONObject(it).getString("type") }
+        assertEquals(listOf("fallback", "thinking", "tool_use"), types)
+        val results = JSONArray(api.requests[1].second).getJSONObject(2).getJSONArray("content")
+        assertEquals(1, results.length())
+        assertEquals("novo", results.getJSONObject(0).getString("tool_use_id"))
     }
 
     @Test

@@ -1,5 +1,7 @@
 package dev.breno.jarvis.model
 
+import dev.breno.jarvis.settings.JarvisSettings
+
 /** Papel da mensagem, com o nome exato usado pela Messages API. */
 enum class Role(val apiName: String) {
     USER("user"),
@@ -28,6 +30,14 @@ enum class PcStatus {
     OFFLINE,
 }
 
+/** Resultado da busca pelo PC na tela de Ajustes. */
+data class DiscoveryState(
+    val searching: Boolean = false,
+    val message: String? = null,
+    /** URL encontrada, para preencher o campo na tela de Ajustes. */
+    val foundUrl: String? = null,
+)
+
 data class JarvisUiState(
     val status: JarvisStatus = JarvisStatus.IDLE,
     val messages: List<ChatMessage> = emptyList(),
@@ -41,4 +51,7 @@ data class JarvisUiState(
     val activity: String? = null,
     val pcStatus: PcStatus = PcStatus.NOT_CONFIGURED,
     val pcToolCount: Int = 0,
+    val settings: JarvisSettings = JarvisSettings("", "", "", ""),
+    val showSettings: Boolean = false,
+    val discovery: DiscoveryState = DiscoveryState(),
 )

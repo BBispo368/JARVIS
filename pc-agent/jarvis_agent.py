@@ -15,9 +15,15 @@ Toda requisição precisa do header "Authorization: Bearer <token>".
 Segurança: o modelo NÃO roda comandos arbitrários. Ele só escolhe, pelo
 nome, apps e atalhos que você mesmo cadastrou no config.json.
 
+Descoberta: o agente também escuta UDP na porta 8766. O app manda um
+broadcast "JARVIS_DISCOVER_V1" e o agente responde com a porta HTTP — assim
+o celular acha o PC mesmo se o IP mudar. O token nunca vai nessa resposta.
+
 Uso:
-    python jarvis_agent.py            # cria o config.json na primeira vez e sobe o servidor
+    python jarvis_agent.py                      # cria o config.json na 1ª vez e sobe o servidor
     python jarvis_agent.py --config caminho/config.json
+    python jarvis_agent.py --install-autostart  # inicia sozinho quando você entra no PC
+    python jarvis_agent.py --uninstall-autostart
 """
 
 from __future__ import annotations
@@ -33,6 +39,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from dataclasses import dataclass
@@ -43,7 +50,9 @@ from typing import Any, Callable, Dict, List, Optional
 SYSTEM = platform.system()  # "Windows", "Darwin" ou "Linux"
 MAX_BODY = 64 * 1024
 MAX_OUTPUT = 1500
-DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().with_name("config.json")
+DISCOVERY_MAGIC = b"JARVIS_DISCOVER_V1"
+AUTOSTART_ID = "dev.breno.jarvis.agent"
 
 
 class ToolError(Exception):
@@ -58,6 +67,7 @@ def default_config() -> Dict[str, Any]:
     return {
         "host": "0.0.0.0",
         "port": 8765,
+        "discovery_port": 8766,
         "token": secrets.token_urlsafe(24),
         # nome falado -> comando do seu sistema (roda via shell)
         "apps": {},
@@ -467,20 +477,159 @@ def create_server(cfg: Dict[str, Any]) -> ThreadingHTTPServer:
     return server
 
 
+# --------------------------------------------------------------------------
+# Descoberta na rede (UDP)
+# --------------------------------------------------------------------------
+
+def discovery_reply(cfg: Dict[str, Any]) -> bytes:
+    return json.dumps(
+        {"service": "jarvis", "port": int(cfg["port"]), "name": socket.gethostname()},
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def start_discovery(cfg: Dict[str, Any], http_port: int) -> Optional[socket.socket]:
+    """Responde aos broadcasts do app numa thread. Devolve o socket (para fechar nos testes)."""
+    port = int(cfg.get("discovery_port", 8766))
+    if port <= 0:
+        return None
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((cfg.get("host", "0.0.0.0"), port))
+    except OSError as e:
+        print(f"[jarvis] Descoberta desligada (porta UDP {port} ocupada: {e}).")
+        sock.close()
+        return None
+    reply = discovery_reply({**cfg, "port": http_port})
+
+    def loop() -> None:
+        while True:
+            try:
+                data, addr = sock.recvfrom(512)
+            except OSError:
+                return  # socket fechado
+            if data.strip() == DISCOVERY_MAGIC:
+                try:
+                    sock.sendto(reply, addr)
+                except OSError:
+                    pass
+
+    threading.Thread(target=loop, name="jarvis-discovery", daemon=True).start()
+    return sock
+
+
+# --------------------------------------------------------------------------
+# Iniciar com o sistema
+# --------------------------------------------------------------------------
+
+def _pythonw() -> str:
+    exe = Path(sys.executable)
+    candidate = exe.with_name("pythonw.exe")
+    return str(candidate if candidate.exists() else exe)
+
+
+def autostart_path() -> Path:
+    if SYSTEM == "Windows":
+        return (Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+                / "Startup" / "JarvisAgent.vbs")
+    if SYSTEM == "Darwin":
+        return Path.home() / "Library" / "LaunchAgents" / f"{AUTOSTART_ID}.plist"
+    return Path.home() / ".config" / "systemd" / "user" / "jarvis-agent.service"
+
+
+def install_autostart(config_path: Path) -> None:
+    script = Path(__file__).resolve()
+    config_path = config_path.resolve()
+    load_config(config_path)  # garante que o config.json (e o token) existem
+    target = autostart_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if SYSTEM == "Windows":
+        # .vbs na pasta Inicializar: roda o pythonw sem janela de console.
+        cmd = f'""{_pythonw()}"" ""{script}"" --config ""{config_path}""'
+        target.write_text(f'CreateObject("WScript.Shell").Run "{cmd}", 0, False\r\n', encoding="utf-8")
+        print(f"[jarvis] Pronto: o agente vai iniciar quando você entrar no Windows ({target}).")
+        print("[jarvis] Para iniciar agora sem reiniciar, dê dois cliques nesse arquivo.")
+    elif SYSTEM == "Darwin":
+        log = Path.home() / "Library" / "Logs" / "jarvis-agent.log"
+        target.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{AUTOSTART_ID}</string>
+  <key>ProgramArguments</key><array>
+    <string>{sys.executable}</string><string>{script}</string>
+    <string>--config</string><string>{config_path}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+</dict></plist>
+""", encoding="utf-8")
+        subprocess.run(["launchctl", "unload", str(target)], capture_output=True)
+        run(["launchctl", "load", "-w", str(target)])
+        print(f"[jarvis] Pronto: agente rodando e configurado para iniciar no login ({target}).")
+    else:
+        target.write_text(f"""[Unit]
+Description=Agente do Jarvis
+After=network-online.target
+
+[Service]
+ExecStart="{sys.executable}" "{script}" --config "{config_path}"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+""", encoding="utf-8")
+        run(["systemctl", "--user", "daemon-reload"])
+        run(["systemctl", "--user", "enable", "--now", "jarvis-agent.service"])
+        print(f"[jarvis] Pronto: serviço systemd do usuário ativo ({target}).")
+        print("[jarvis] Logs: journalctl --user -u jarvis-agent -f")
+
+
+def uninstall_autostart() -> None:
+    target = autostart_path()
+    if SYSTEM == "Darwin" and target.exists():
+        subprocess.run(["launchctl", "unload", "-w", str(target)], capture_output=True)
+    elif SYSTEM == "Linux" and target.exists():
+        subprocess.run(["systemctl", "--user", "disable", "--now", "jarvis-agent.service"], capture_output=True)
+    if target.exists():
+        target.unlink()
+        print(f"[jarvis] Início automático removido ({target}).")
+    else:
+        print("[jarvis] O início automático não estava instalado.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Agente do Jarvis no PC")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    parser.add_argument("--install-autostart", action="store_true", help="iniciar com o sistema")
+    parser.add_argument("--uninstall-autostart", action="store_true", help="parar de iniciar com o sistema")
     args = parser.parse_args()
+
+    if args.install_autostart:
+        install_autostart(args.config)
+        return
+    if args.uninstall_autostart:
+        uninstall_autostart()
+        return
 
     cfg = load_config(args.config)
     server = create_server(cfg)
     port = server.server_address[1]
+    discovery = start_discovery(cfg, port)
     names = ", ".join(build_tools(cfg))
     print(f"[jarvis] Agente no ar em http://{lan_ip()}:{port}  ({SYSTEM})")
     print(f"[jarvis] Ferramentas: {names}")
-    print("[jarvis] No local.properties do app:")
-    print(f"           PC_AGENT_URL=http://{lan_ip()}:{port}")
-    print(f"           PC_AGENT_TOKEN=<o 'token' de {args.config}>")
+    if discovery:
+        print(f"[jarvis] Descoberta na rede ativa (UDP {cfg.get('discovery_port', 8766)}).")
+    # Só mostra o token num terminal interativo (nunca em arquivo de log do início automático).
+    if sys.stdout.isatty():
+        print("[jarvis] No app: Ajustes → Token do PC →", cfg["token"])
+    else:
+        print(f"[jarvis] Token: veja o campo 'token' em {args.config.resolve()}")
     print("[jarvis] Ctrl+C para sair.")
     try:
         server.serve_forever()

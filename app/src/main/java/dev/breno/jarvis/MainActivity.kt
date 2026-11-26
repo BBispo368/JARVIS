@@ -12,6 +12,7 @@ import androidx.compose.runtime.getValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.breno.jarvis.ui.JarvisScreen
+import dev.breno.jarvis.ui.SettingsScreen
 import dev.breno.jarvis.ui.theme.JarvisTheme
 
 class MainActivity : ComponentActivity() {
@@ -28,12 +29,23 @@ class MainActivity : ComponentActivity() {
         setContent {
             JarvisTheme {
                 val state by viewModel.state.collectAsStateWithLifecycle()
-                JarvisScreen(
-                    state = state,
-                    onOrbTap = ::onOrbTap,
-                    onConversationModeChange = viewModel::setConversationMode,
-                    onPcStatusTap = viewModel::refreshPcTools,
-                )
+                if (state.showSettings) {
+                    SettingsScreen(
+                        initial = state.settings,
+                        discovery = state.discovery,
+                        onDiscover = viewModel::discoverPc,
+                        onSave = viewModel::saveSettings,
+                        onCancel = viewModel::closeSettings,
+                    )
+                } else {
+                    JarvisScreen(
+                        state = state,
+                        onOrbTap = ::onOrbTap,
+                        onConversationModeChange = viewModel::setConversationMode,
+                        onPcStatusTap = viewModel::refreshPcTools,
+                        onOpenSettings = viewModel::openSettings,
+                    )
+                }
             }
         }
     }

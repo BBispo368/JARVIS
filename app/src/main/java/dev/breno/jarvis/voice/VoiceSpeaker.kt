@@ -8,11 +8,16 @@ import android.speech.tts.UtteranceProgressListener
 import java.util.Locale
 
 /**
- * Envolve o [TextToSpeech] em pt-BR.
+ * Envolve o [TextToSpeech] em pt-BR, com uma fila de frases por "sessão":
  *
- * Os callbacks do [UtteranceProgressListener] chegam numa thread interna do
- * TTS; aqui eles são repassados pra main via [Handler] — assim quem recebe
+ *     begin() → enqueue(frase)… → end()  ⇒  onFinished() quando a última frase acabar
+ *
+ * Assim o Jarvis fala a primeira frase enquanto a resposta ainda chega pelo
+ * streaming. Os callbacks do [UtteranceProgressListener] chegam numa thread
+ * interna do TTS e são repassados pra main via [Handler] — assim quem recebe
  * [onFinished] pode reiniciar o SpeechRecognizer com segurança.
+ *
+ * Todos os métodos públicos devem ser chamados na main thread.
  */
 class VoiceSpeaker(
     context: Context,
@@ -21,10 +26,16 @@ class VoiceSpeaker(
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var ready = false
-    private var pendingText: String? = null
+    /** TTS falhou ao iniciar: as falas são puladas, mas o ciclo continua (sem travar em "Falando"). */
+    private var broken = false
     private var utteranceCounter = 0
-    /** Só o enunciado atual dispara callbacks; um stop() invalida o anterior. */
-    private var currentUtteranceId: String? = null
+
+    private var sessionActive = false
+    private var sessionEnded = false
+    /** Frases recebidas antes do TTS terminar de iniciar. */
+    private val waiting = ArrayDeque<String>()
+    /** Frases já entregues ao TTS e ainda não terminadas. */
+    private val outstanding = mutableSetOf<String>()
 
     private val tts: TextToSpeech = TextToSpeech(context.applicationContext) { status ->
         mainHandler.post { onInit(status) }
@@ -32,7 +43,10 @@ class VoiceSpeaker(
 
     private fun onInit(status: Int) {
         if (status != TextToSpeech.SUCCESS) {
+            broken = true
+            waiting.clear()
             onError("Não foi possível iniciar a voz (TextToSpeech).")
+            checkDone()
             return
         }
         val result = tts.setLanguage(Locale.forLanguageTag("pt-BR"))
@@ -41,28 +55,38 @@ class VoiceSpeaker(
         }
         tts.setOnUtteranceProgressListener(progressListener)
         ready = true
-        pendingText?.let { pendingText = null; speak(it) }
+        while (waiting.isNotEmpty()) submit(waiting.removeFirst())
+        checkDone()
     }
 
-    fun speak(text: String) {
+    /** Começa uma nova fala (interrompe a anterior sem disparar [onFinished]). */
+    fun begin() {
+        stop()
+        sessionActive = true
+        sessionEnded = false
+    }
+
+    /** Põe uma frase na fila da sessão atual. */
+    fun enqueue(text: String) {
+        if (!sessionActive || sessionEnded) return
         val clean = cleanForSpeech(text)
-        if (clean.isBlank()) {
-            onFinished()
-            return
-        }
-        if (!ready) {
-            pendingText = clean
-            return
-        }
-        val id = "jarvis-${++utteranceCounter}"
-        currentUtteranceId = id
-        tts.speak(clean, TextToSpeech.QUEUE_FLUSH, null, id)
+        if (clean.isBlank() || broken) return
+        if (ready) submit(clean) else waiting.addLast(clean)
+    }
+
+    /** Não virão mais frases: [onFinished] dispara quando a fila esvaziar. */
+    fun end() {
+        if (!sessionActive) return
+        sessionEnded = true
+        checkDone()
     }
 
     /** Interrompe a fala sem disparar [onFinished]. */
     fun stop() {
-        currentUtteranceId = null
-        pendingText = null
+        sessionActive = false
+        sessionEnded = false
+        waiting.clear()
+        outstanding.clear()
         if (ready) tts.stop()
     }
 
@@ -72,15 +96,25 @@ class VoiceSpeaker(
         tts.shutdown()
     }
 
+    private fun submit(text: String) {
+        val id = "jarvis-${++utteranceCounter}"
+        outstanding += id
+        tts.speak(text, TextToSpeech.QUEUE_ADD, null, id)
+    }
+
+    private fun checkDone() {
+        if (sessionActive && sessionEnded && outstanding.isEmpty() && waiting.isEmpty() && (ready || broken)) {
+            sessionActive = false
+            onFinished()
+        }
+    }
+
     private val progressListener = object : UtteranceProgressListener() {
         override fun onStart(utteranceId: String?) = Unit
 
         override fun onDone(utteranceId: String?) {
             mainHandler.post {
-                if (utteranceId != null && utteranceId == currentUtteranceId) {
-                    currentUtteranceId = null
-                    onFinished()
-                }
+                if (utteranceId != null && outstanding.remove(utteranceId)) checkDone()
             }
         }
 
@@ -91,9 +125,10 @@ class VoiceSpeaker(
 
         private fun handleError(utteranceId: String?, errorCode: Int) {
             mainHandler.post {
-                if (utteranceId != null && utteranceId == currentUtteranceId) {
-                    currentUtteranceId = null
+                // Pula a frase com erro e segue a fila; o ciclo não pode travar.
+                if (utteranceId != null && outstanding.remove(utteranceId)) {
                     this@VoiceSpeaker.onError("Erro ao falar a resposta (código $errorCode).")
+                    checkDone()
                 }
             }
         }

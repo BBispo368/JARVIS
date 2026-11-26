@@ -96,5 +96,35 @@ class AgentServerTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 400)
 
 
+class DiscoveryTest(unittest.TestCase):
+    def test_responde_ao_broadcast_sem_vazar_token(self):
+        import socket
+        cfg = dict(CFG, discovery_port=0)
+        # porta 0 desliga; usa uma porta livre qualquer
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        cfg["discovery_port"] = port
+        sock = ja.start_discovery(cfg, http_port=8765)
+        self.assertIsNotNone(sock)
+        try:
+            client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            client.settimeout(3)
+            client.sendto(b"lixo", ("127.0.0.1", port))
+            client.sendto(ja.DISCOVERY_MAGIC, ("127.0.0.1", port))
+            data, _ = client.recvfrom(1024)
+            reply = json.loads(data)
+            self.assertEqual(reply["service"], "jarvis")
+            self.assertEqual(reply["port"], 8765)
+            self.assertNotIn(TOKEN, data.decode())
+            client.close()
+        finally:
+            sock.close()
+
+    def test_porta_zero_desliga_descoberta(self):
+        self.assertIsNone(ja.start_discovery(dict(CFG, discovery_port=0), http_port=8765))
+
+
 if __name__ == "__main__":
     unittest.main()

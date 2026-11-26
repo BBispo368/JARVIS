@@ -15,17 +15,22 @@ app/src/main/java/dev/breno/jarvis/
 ├── MainActivity.kt          # edge-to-edge, permissão do microfone, setContent
 ├── JarvisViewModel.kt       # estado (StateFlow), histórico, ciclo ouvir → pensar → falar
 ├── model/ChatMessage.kt     # Role, ChatMessage, JarvisStatus, JarvisUiState
-├── api/ClaudeClient.kt      # chamada HTTP à Messages API
+├── api/ClaudeClient.kt      # chamada à Messages API em streaming (SSE)
+├── api/StreamAccumulator.kt # remonta a resposta a partir dos eventos SSE
 ├── agent/
 │   ├── JarvisAgent.kt       # loop de tool calling (tool_use → tool_result → resposta)
 │   ├── JarvisTool.kt        # interface das ferramentas + helpers de schema
 │   └── ConversationHistory.kt # histórico por turnos, janela de ~20 mensagens
 ├── tools/PhoneTools.kt      # ferramentas do celular: timer, alarme, lanterna
-├── pc/PcAgentClient.kt      # descobre e chama as ferramentas do agente do PC
+├── pc/PcAgentClient.kt      # lista e chama as ferramentas do agente do PC
+├── pc/PcDiscovery.kt        # acha o PC na rede local (broadcast UDP)
+├── settings/SettingsStore.kt # chave, modelo e token do PC salvos no app
 ├── voice/SpeechListener.kt  # SpeechRecognizer (main thread), erros em português
-├── voice/VoiceSpeaker.kt    # TextToSpeech pt-BR + limpeza de markdown
+├── voice/VoiceSpeaker.kt    # TextToSpeech pt-BR com fila de frases + limpeza de markdown
+├── voice/SentenceSplitter.kt # corta o texto do streaming em frases para falar logo
 └── ui/
     ├── JarvisScreen.kt      # título, chat em bolhas, status, orb, switch
+    ├── SettingsScreen.kt    # tela de Ajustes
     ├── Orb.kt               # orb com gradiente radial animado
     └── theme/Theme.kt       # cores do tema escuro
 
@@ -37,19 +42,25 @@ pc-agent/
 
 ## 1. Configurar a API key
 
-1. Crie uma chave em <https://console.anthropic.com/settings/keys>.
-2. Na raiz do projeto, copie o modelo:
+Crie uma chave em <https://console.anthropic.com/settings/keys>. Há dois jeitos de colocá-la no app:
+
+- **Pelo app (mais fácil):** abra o Jarvis, toque em **Ajustes** (canto superior direito), cole a chave e salve. Não precisa recompilar. Na primeira vez sem chave, os Ajustes abrem sozinhos.
+- **Pelo `local.properties`:** vira o valor inicial embutido no APK, útil se você reinstala com frequência. O que você salvar em Ajustes tem prioridade.
+
+Para usar o `local.properties`:
+
+1. Na raiz do projeto, copie o modelo:
    ```bash
    cp local.properties.example local.properties
    ```
-3. Edite o `local.properties`:
+2. Edite o `local.properties`:
    ```properties
    CLAUDE_API_KEY=sk-ant-sua-chave-aqui
    CLAUDE_MODEL=claude-sonnet-5-5   # opcional
    ```
    O Android Studio também grava `sdk.dir=...` nesse arquivo. Pode deixar.
 
-O `local.properties` está no `.gitignore` e **nunca** vai para o repositório. A chave entra no app pelo `BuildConfig` na hora de compilar, então **recompile** depois de trocar a chave. Se ela estiver vazia, o app avisa na tela.
+O `local.properties` está no `.gitignore` e **nunca** vai para o repositório. A chave entra no app pelo `BuildConfig` na hora de compilar. A chave salva em Ajustes fica no armazenamento privado do app (o backup do Android está desligado).
 
 > ⚠️ A chave fica embutida no APK. Isso serve para uso pessoal; não distribua esse APK para outras pessoas.
 
@@ -104,6 +115,7 @@ Com o **Modo conversa** ligado (padrão), o Jarvis volta a ouvir quando termina 
 ## Detalhes da chamada à API
 
 - `POST https://api.anthropic.com/v1/messages` com `x-api-key` e `anthropic-version: 2023-06-01`.
+- **Streaming** (`"stream": true`): o Jarvis começa a falar a primeira frase enquanto o resto da resposta ainda está chegando, e a bolha do chat vai sendo preenchida ao vivo. Tocar no orb no meio da resposta corta a fala, cancela a chamada e já começa a ouvir.
 - Vão as últimas 20 mensagens do histórico, sempre começando por uma do usuário. Se a chamada falhar, a pergunta é removida do histórico para manter a alternância user/assistant.
 - `output_config.effort = "low"`: as respostas são curtas e faladas, então pouco raciocínio deixa tudo mais rápido.
 - `fallbacks: "default"` (beta `server-side-fallback-2026-07-01`): se o filtro de segurança recusar uma pergunta, o próprio servidor tenta outro modelo. Se a recusa continuar, o Jarvis responde com uma frase curta.
@@ -153,15 +165,25 @@ Enquanto usa uma ferramenta, a tela mostra o que ele está fazendo ("Criando tim
    python jarvis_agent.py
    ```
    Na primeira vez ele cria o `pc-agent/config.json` com um **token aleatório**. Esse arquivo está no `.gitignore`. Depois ele mostra o endereço, algo como `http://192.168.0.10:8765`.
-3. No `local.properties` do app, coloque o endereço e o token (o `token` do `config.json`):
-   ```properties
-   PC_AGENT_URL=http://192.168.0.10:8765
-   PC_AGENT_TOKEN=o-token-do-config-json
-   ```
-   Recompile e instale o app. O indicador deve mostrar "PC conectado".
+3. No celular: **Ajustes → Token do PC**, cole o token que o agente mostrou no terminal, toque em **Procurar PC na rede** e depois em **Salvar**. O indicador deve mostrar "PC conectado".
+   - Não precisa saber o IP: o app acha o PC por broadcast na rede (UDP 8766). Se o IP do PC mudar, ele acha de novo sozinho.
+   - Se a busca não achar (alguns roteadores bloqueiam broadcast), digite o endereço em *Endereço do PC*, por exemplo `http://192.168.0.10:8765`.
+   - Também dá para deixar `PC_AGENT_URL` e `PC_AGENT_TOKEN` no `local.properties`, como valores iniciais.
 4. **Firewall**: no Windows, quando aparecer o aviso do Firewall, permita o Python em **redes privadas**. A rede Wi-Fi de casa precisa estar marcada como *Privada*. No macOS, clique em *Permitir* no aviso de conexões de entrada.
+5. **Iniciar junto com o PC** (opcional), depois de testar que funciona:
+   ```bash
+   python jarvis_agent.py --install-autostart
+   ```
+   - **Windows:** cria um atalho invisível na pasta *Inicializar*, que roda sem janela de console.
+   - **macOS:** cria um LaunchAgent.
+   - **Linux:** cria um serviço systemd do usuário.
 
-O celular e o PC precisam estar na **mesma rede Wi-Fi**. Para o IP do PC não mudar, fixe um IP para ele no roteador (reserva DHCP). Senão, você vai precisar atualizar o `PC_AGENT_URL` e recompilar.
+   Para desfazer:
+   ```bash
+   python jarvis_agent.py --uninstall-autostart
+   ```
+
+O celular e o PC precisam estar na **mesma rede Wi-Fi**.
 
 ### Configurar apps e atalhos
 
@@ -209,7 +231,8 @@ cd pc-agent && python -m unittest -v test_jarvis_agent.py
 
 ### Problemas comuns da Fase 2
 
-- **"PC offline"**: o agente está rodando? Celular e PC estão no mesmo Wi-Fi? O IP do PC mudou? Teste no navegador do celular: `http://IP-DO-PC:8765/health` deve responder `{"ok": false, "error": "não autorizado"}`. Se não abrir, é rede ou firewall.
-- **"token recusado pelo PC"**: o `PC_AGENT_TOKEN` não bate com o `token` do `config.json`. Corrija e recompile.
+- **"PC offline"**: o agente está rodando? Celular e PC estão no mesmo Wi-Fi? Teste no navegador do celular: `http://IP-DO-PC:8765/health` deve responder `{"ok": false, "error": "não autorizado"}`. Se não abrir, é rede ou firewall.
+- **"Procurar PC na rede" não acha nada, mas o `/health` abre**: o roteador bloqueia broadcast. Digite o endereço manualmente em Ajustes.
+- **"token recusado pelo PC"**: o token em Ajustes não bate com o `token` do `pc-agent/config.json`.
 - **Redes de visitante ou corporativas** costumam bloquear a comunicação entre aparelhos ("isolamento de cliente"). Use a rede principal de casa.
 - **Timer ou alarme não aparece**: precisa de um app de relógio que aceite pedidos de outros apps (o Relógio do Google aceita).
