@@ -1,0 +1,17 @@
+# Segredos / config local
+local.properties
+
+# Gradle / build
+.gradle/
+build/
+.kotlin/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+
+# IDE
+.idea/
+*.iml
+.DS_Store
