@@ -161,7 +161,7 @@ Se você trocar o `CLAUDE_MODEL` por um modelo antigo que não aceite `effort` o
 | Celular | `phone_set_alarm` | "me acorda às seis e meia" |
 | Celular | `phone_flashlight` | "liga a lanterna" |
 | PC | `pc_open_url` | "abre o YouTube no PC", "pesquisa receita de lasanha" |
-| PC | `pc_open_app` | "abre o Spotify" (só apps do `config.json`) |
+| PC | `pc_open_app` | "abre o Spotify", "abre a calculadora" (qualquer programa instalado) |
 | PC | `pc_run_shortcut` | "qual meu IP público?" (só atalhos do `config.json`) |
 | PC | `pc_media` | "pausa a música", "aumenta o volume" |
 | PC | `pc_lock_screen` | "bloqueia o computador" |
@@ -231,7 +231,8 @@ Edite o `pc-agent/config.json`, usando o `config.example.json` como base, e rein
 }
 ```
 
-- **`apps`**: nome falado → comando que abre o app no **seu** sistema. No Windows: `start chrome`, `notepad`; no macOS: `open -a Spotify`; no Linux: `firefox`.
+- **Programas instalados são achados sozinhos** (`"auto_apps": true`, o padrão): no Windows, tudo que está no menu Iniciar, inclusive apps da Microsoft Store; no macOS, a pasta Aplicativos; no Linux, os atalhos `.desktop`. O nome pode ser aproximado ("abre o chrome" abre o Google Chrome). Programa instalado depois que o agente subiu aparece em até 10 minutos, ou na hora se você reiniciar o agente.
+- **`apps`** (opcional): para algo que não está no menu Iniciar, ou para dar um apelido: nome falado → comando do **seu** sistema. No Windows: `start chrome`, `notepad`; no macOS: `open -a Spotify`; no Linux: `firefox`.
 - **`shortcuts`**: qualquer comando seu. A `description` é o que o Claude lê para decidir quando usar. A saída do comando volta para ele (útil para perguntas).
 - O exemplo de `config.example.json` usa comandos do Windows. Troque pelos do seu sistema.
 

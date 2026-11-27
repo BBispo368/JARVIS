@@ -2,11 +2,9 @@
   "host": "0.0.0.0",
   "port": 8765,
   "token": "TROQUE-POR-UM-TOKEN-LONGO-E-ALEATORIO",
+  "auto_apps": true,
   "apps": {
-    "navegador": "start chrome",
-    "spotify": "start spotify:",
-    "vscode": "code",
-    "calculadora": "calc"
+    "spotify": "start spotify:"
   },
   "shortcuts": {
     "ip_publico": {

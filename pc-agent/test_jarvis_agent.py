@@ -15,6 +15,7 @@ CFG = {
     "host": "127.0.0.1",
     "port": 0,
     "token": TOKEN,
+    "auto_apps": False,  # testes não dependem dos programas desta máquina
     "apps": {"editor": "true"},
     "shortcuts": {
         "eco": {"description": "imprime ola", "command": f'"{sys.executable}" -c "print(\'olá\')"'},
@@ -55,7 +56,7 @@ class AgentServerTest(unittest.TestCase):
         self.assertEqual(code, 200)
         tools = {t["name"]: t for t in body["tools"]}
         self.assertIn("pc_open_url", tools)
-        self.assertEqual(tools["pc_open_app"]["input_schema"]["properties"]["name"]["enum"], ["editor"])
+        self.assertIn("editor", tools["pc_open_app"]["description"])
         self.assertEqual(tools["pc_run_shortcut"]["input_schema"]["properties"]["name"]["enum"], ["eco", "falha"])
         for t in tools.values():
             self.assertRegex(t["name"], r"^[a-zA-Z0-9_-]{1,64}$")
@@ -94,6 +95,52 @@ class AgentServerTest(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             urllib.request.urlopen(req, timeout=10)
         self.assertEqual(ctx.exception.code, 400)
+
+
+class OpenAppTest(unittest.TestCase):
+    NAMES = ["Spotify", "Spotify Widget", "Google Chrome", "Visual Studio Code", "Calculadora",
+             "Microsoft Edge", "WhatsApp", "Configurações", "Desinstalar Algo"]
+
+    def test_normalize(self):
+        self.assertEqual(ja.normalize("  Configurações® "), "configuracoes")
+
+    def test_find_apps(self):
+        self.assertEqual(ja.find_apps("spotify", self.NAMES)[0], "Spotify")
+        self.assertEqual(ja.find_apps("chrome", self.NAMES), ["Google Chrome"])
+        self.assertEqual(ja.find_apps("vs code", self.NAMES), [])
+        self.assertEqual(ja.find_apps("visual studio", self.NAMES), ["Visual Studio Code"])
+        self.assertEqual(ja.find_apps("configuracoes", self.NAMES), ["Configurações"])
+        self.assertEqual(ja.find_apps("photoshop", self.NAMES), [])
+
+    def test_handler_abre_o_mais_provavel_e_reclama_se_ambiguo(self):
+        opened = []
+        installed = {n: (lambda n=n: opened.append(n)) for n in self.NAMES}
+        handler = ja.make_open_app({}, lambda: installed)
+        self.assertEqual(handler({"name": "spotify"}), "Abrindo Spotify.")
+        self.assertEqual(handler({"name": "whatsapp"}), "Abrindo WhatsApp.")
+        self.assertEqual(opened, ["Spotify", "WhatsApp"])
+        with self.assertRaises(ja.ToolError):
+            handler({"name": "photoshop"})
+
+    def test_descoberta_no_windows_le_get_startapps_e_filtra_lixo(self):
+        fake = json.dumps([
+            {"Name": "Spotify", "AppID": "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"},
+            {"Name": "Google Chrome", "AppID": "Chrome"},
+            {"Name": "Desinstalar o Programa X", "AppID": "X-uninstall"},
+        ])
+        launched = []
+        with mock.patch.object(ja, "SYSTEM", "Windows"), \
+             mock.patch.object(ja, "run", return_value=fake), \
+             mock.patch.object(ja, "_popen", side_effect=launched.append):
+            apps = ja.discover_installed_apps()
+            self.assertEqual(sorted(apps), ["Google Chrome", "Spotify"])
+            apps["Spotify"]()
+        self.assertEqual(launched, [["explorer.exe", "shell:AppsFolder\\SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"]])
+
+    def test_descoberta_falha_sem_derrubar(self):
+        with mock.patch.object(ja, "SYSTEM", "Windows"), \
+             mock.patch.object(ja, "run", side_effect=ja.ToolError("sem powershell")):
+            self.assertEqual(ja.discover_installed_apps(), {})
 
 
 class DiscoveryTest(unittest.TestCase):

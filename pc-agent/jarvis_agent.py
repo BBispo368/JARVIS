@@ -41,6 +41,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import webbrowser
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -70,6 +71,8 @@ def default_config() -> Dict[str, Any]:
         "discovery_port": 8766,
         "token": secrets.token_urlsafe(24),
         # nome falado -> comando do seu sistema (roda via shell)
+        # Acha sozinho os programas instalados (menu Iniciar / Aplicativos) para o pc_open_app.
+        "auto_apps": True,
         "apps": {},
         # nome -> {"description": "...", "command": "..."}
         "shortcuts": {},
@@ -172,15 +175,115 @@ def tool_open_url(inp: Dict[str, Any]) -> str:
     return f"Abri {url} no navegador."
 
 
-def make_open_app(apps: Dict[str, str]) -> Callable[[Dict[str, Any]], str]:
-    def handler(inp: Dict[str, Any]) -> str:
-        name = str(inp.get("name", ""))
-        cmd = apps.get(name)
-        if not cmd:
-            raise ToolError(f"app '{name}' não está no config.json")
+# --------------------------------------------------------------------------
+# Programas instalados (para o pc_open_app sem precisar cadastrar nada)
+# --------------------------------------------------------------------------
+
+Launcher = Callable[[], None]
+
+# Atalhos do menu Iniciar que não são programas de verdade.
+_JUNK = ("desinstal", "uninstall", "leia-me", "leiame", "readme", "release notes", "notas de vers",
+         "documenta", "manual", "help", "ajuda", "website", "site da web", "license", "licen")
+
+
+def normalize(text: str) -> str:
+    """'Microsoft Edge®' -> 'microsoft edge'; tira acentos, pontuação e caixa."""
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c)).lower()
+    return " ".join("".join(c if c.isalnum() else " " for c in text).split())
+
+
+def _popen(args: List[str]) -> None:
+    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def discover_installed_apps() -> Dict[str, Launcher]:
+    """Programas instalados -> como abrir. Nunca lança erro: sem lista, devolve {}."""
+    apps: Dict[str, Launcher] = {}
+    try:
+        if SYSTEM == "Windows":
+            # Get-StartApps lista o menu Iniciar inteiro, inclusive apps da Microsoft Store.
+            ps = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+                  "Get-StartApps | Select-Object Name, AppID | ConvertTo-Json -Compress")
+            out = run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], timeout=30)
+            data = json.loads(out) if out else []
+            for item in data if isinstance(data, list) else [data]:
+                name, app_id = str(item.get("Name", "")).strip(), str(item.get("AppID", "")).strip()
+                if name and app_id:
+                    apps.setdefault(name, lambda a=app_id: _popen(["explorer.exe", f"shell:AppsFolder\\{a}"]))
+        elif SYSTEM == "Darwin":
+            roots = [Path("/Applications"), Path("/System/Applications"), Path.home() / "Applications"]
+            for root in roots:
+                for app in sorted(root.glob("*.app")) + sorted(root.glob("*/*.app")):
+                    apps.setdefault(app.stem, lambda p=str(app): _popen(["open", "-a", p]))
+        else:
+            roots = [Path("/usr/share/applications"), Path.home() / ".local/share/applications",
+                     Path("/var/lib/flatpak/exports/share/applications")]
+            launcher = which_first("gtk-launch", "gio")
+            for root in roots:
+                for desktop in sorted(root.glob("*.desktop")):
+                    name, hidden = _desktop_entry(desktop)
+                    if not name or hidden or not launcher:
+                        continue
+                    if launcher == "gtk-launch":
+                        apps.setdefault(name, lambda d=desktop.name: _popen(["gtk-launch", d]))
+                    else:
+                        apps.setdefault(name, lambda d=str(desktop): _popen(["gio", "launch", d]))
+    except Exception as e:  # noqa: BLE001 - lista de apps é um extra; o agente sobe mesmo sem ela
+        print(f"[jarvis] Não consegui listar os programas instalados: {e}")
+        return {}
+    return {n: f for n, f in apps.items() if not any(j in normalize(n) for j in _JUNK)}
+
+
+def _desktop_entry(path: Path):
+    name, hidden, in_entry = None, False, False
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            in_entry = line == "[Desktop Entry]"
+        elif in_entry and line.startswith("Name=") and name is None:
+            name = line[5:].strip()
+        elif in_entry and line in ("NoDisplay=true", "Hidden=true"):
+            hidden = True
+    return name, hidden
+
+
+def find_apps(query: str, names: List[str]) -> List[str]:
+    """Nomes que combinam com o pedido, do mais provável ao menos provável."""
+    q = normalize(query)
+    if not q:
+        return []
+    norm = {n: normalize(n) for n in names}
+    exact = [n for n in names if norm[n] == q]
+    if exact:
+        return exact
+    q_tokens = q.split()
+    hits = [n for n in names if q in norm[n] or all(t in norm[n].split() for t in q_tokens)]
+    # Prefere nomes que começam com o pedido e nomes mais curtos ("Spotify" antes de "Spotify Widget").
+    return sorted(hits, key=lambda n: (not norm[n].startswith(q), len(n)))
+
+
+def make_open_app(manual: Dict[str, str], installed: Callable[[], Dict[str, Launcher]]):
+    def launch_manual(cmd: str) -> Launcher:
         # Comando escrito por você no config; o modelo só escolhe o nome.
-        subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return f"Abrindo {name}."
+        return lambda: subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def handler(inp: Dict[str, Any]) -> str:
+        query = str(inp.get("name", "")).strip()
+        catalog: Dict[str, Launcher] = {n: launch_manual(c) for n, c in manual.items()}
+        for n, f in installed().items():
+            catalog.setdefault(n, f)
+        matches = find_apps(query, list(catalog))
+        if not matches:
+            raise ToolError(f"não achei nenhum programa instalado parecido com '{query}'")
+        best = matches[0]
+        ambiguous = (len(matches) > 1 and normalize(best) != normalize(query)
+                     and not normalize(best).startswith(normalize(query)))
+        if ambiguous:
+            raise ToolError("achei mais de um programa parecido: " + ", ".join(matches[:6])
+                            + ". Chame de novo com o nome exato.")
+        catalog[best]()
+        return f"Abrindo {best}."
     return handler
 
 
@@ -343,7 +446,8 @@ def build_tools(cfg: Dict[str, Any]) -> Dict[str, Tool]:
         Tool(
             "pc_open_url", "Abrindo no navegador do PC",
             "Abre um endereço http(s) no navegador padrão do computador do Breno. Para pesquisas, "
-            "monte a URL de busca (ex.: https://www.google.com/search?q=...).",
+            "monte a URL de busca (ex.: https://www.google.com/search?q=...). Para abrir programas "
+            "instalados, use pc_open_app em vez desta.",
             obj_schema({"url": {"type": "string", "description": "URL completa começando com http:// ou https://"}}),
             tool_open_url,
         ),
@@ -374,13 +478,25 @@ def build_tools(cfg: Dict[str, Any]) -> Dict[str, Tool]:
         ),
     ]
 
-    apps: Dict[str, str] = cfg.get("apps") or {}
-    if apps:
+    manual: Dict[str, str] = cfg.get("apps") or {}
+    installed: Dict[str, Launcher] = discover_installed_apps() if cfg.get("auto_apps", True) else {}
+    cache = {"apps": installed, "at": time.time()}
+
+    def installed_now() -> Dict[str, Launcher]:
+        # Reescaneia de vez em quando, para achar programas instalados depois que o agente subiu.
+        if cfg.get("auto_apps", True) and time.time() - cache["at"] > 600:
+            cache["apps"], cache["at"] = discover_installed_apps(), time.time()
+        return cache["apps"]
+
+    names = sorted(set(manual) | set(installed), key=str.lower)
+    if names:
+        listing = ", ".join(names[:300]) + (" …" if len(names) > 300 else "")
         tools.append(Tool(
-            "pc_open_app", "Abrindo app no PC",
-            "Abre um aplicativo no computador. Apps disponíveis: " + ", ".join(sorted(apps)) + ".",
-            obj_schema({"name": {"type": "string", "enum": sorted(apps), "description": "Nome do app"}}),
-            make_open_app(apps),
+            "pc_open_app", "Abrindo programa no PC",
+            "Abre um programa instalado no computador (não use o navegador para isso). "
+            "Passe o nome do programa; pode ser aproximado. Programas instalados: " + listing + ".",
+            obj_schema({"name": {"type": "string", "description": "Nome do programa, ex.: Spotify, Google Chrome"}}),
+            make_open_app(manual, installed_now),
         ))
 
     shortcuts: Dict[str, Dict[str, str]] = cfg.get("shortcuts") or {}
