@@ -43,7 +43,11 @@ class GeminiClientTest {
     @After
     fun tearDown() = server.stop(0)
 
-    private fun client() = GeminiClient("chave-g", "gemini-3.8-flash", baseUrl = "http://127.0.0.1:${server.address.port}/v1beta")
+    private fun client(fallbacks: List<String> = emptyList()) = GeminiClient(
+        "chave-g", "gemini-3.8-flash",
+        baseUrl = "http://127.0.0.1:${server.address.port}/v1beta",
+        fallbackModels = fallbacks, retryDelayMs = 1,
+    )
     private fun sse(vararg chunks: String) = chunks.joinToString("") { "data: $it\r\n\r\n" }
 
     private class EchoTool : JarvisTool {
@@ -118,6 +122,45 @@ class GeminiClientTest {
             runBlocking { client().createMessage("s", JSONArray(), null) {} }
         }
         assertTrue(e.message!!.contains("Limite gratuito"))
+    }
+
+    @Test
+    fun `503 tenta de novo e depois troca de modelo`() = runBlocking {
+        val overloaded = 503 to """{"error":{"code":503,"message":"This model is currently experiencing high demand.","status":"UNAVAILABLE"}}"""
+        replies += overloaded // 3.8, 1ª tentativa
+        replies += overloaded // 3.8, 2ª tentativa
+        replies += 200 to sse("""{"candidates":[{"content":{"parts":[{"text":"Aqui, senhor."}]},"finishReason":"STOP"}]}""")
+        val c = client(fallbacks = listOf("gemini-3.6-flash"))
+        val r = c.createMessage("s", JSONArray().put(JSONObject().put("role", "user").put("content", "oi")), null) {}
+
+        assertEquals("Aqui, senhor.", r.text)
+        assertEquals(3, paths.size)
+        assertTrue(paths[0].contains("gemini-3.8-flash"))
+        assertTrue(paths[1].contains("gemini-3.8-flash"))
+        assertTrue(paths[2].contains("gemini-3.6-flash"))
+        assertEquals("gemini-3.6-flash", c.currentModel)
+
+        // A próxima chamada já começa no modelo que funcionou.
+        replies += 200 to sse("""{"candidates":[{"content":{"parts":[{"text":"De novo."}]},"finishReason":"STOP"}]}""")
+        c.createMessage("s", JSONArray().put(JSONObject().put("role", "user").put("content", "oi")), null) {}
+        assertTrue(paths[3].contains("gemini-3.6-flash"))
+    }
+
+    @Test
+    fun `429 pula direto para o proximo modelo e sem reserva mostra aviso`() = runBlocking {
+        val quota = 429 to """{"error":{"code":429,"message":"Quota exceeded","status":"RESOURCE_EXHAUSTED"}}"""
+        replies += quota
+        replies += 200 to sse("""{"candidates":[{"content":{"parts":[{"text":"Ok."}]},"finishReason":"STOP"}]}""")
+        client(fallbacks = listOf("gemini-3.5-flash-lite"))
+            .createMessage("s", JSONArray().put(JSONObject().put("role", "user").put("content", "oi")), null) {}
+        assertTrue(paths[1].contains("gemini-3.5-flash-lite"))
+
+        replies += 503 to """{"error":{"code":503,"message":"high demand","status":"UNAVAILABLE"}}"""
+        replies += 503 to """{"error":{"code":503,"message":"high demand","status":"UNAVAILABLE"}}"""
+        val e = assertThrows(ClaudeException::class.java) {
+            runBlocking { client().createMessage("s", JSONArray(), null) {} }
+        }
+        assertTrue(e.message!!.contains("sobrecarregados"))
     }
 
     @Test

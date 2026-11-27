@@ -3,6 +3,7 @@ package dev.breno.jarvis.api
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -23,13 +24,26 @@ import kotlin.coroutines.coroutineContext
  */
 class GeminiClient(
     private val apiKey: String,
-    private val model: String,
+    model: String,
     private val http: OkHttpClient = ClaudeClient.defaultHttpClient(),
     private val baseUrl: String = BASE_URL,
+    fallbackModels: List<String> = DEFAULT_FALLBACKS,
+    private val retryDelayMs: Long = 800,
+    private val clock: () -> Long = System::currentTimeMillis,
 ) : MessagesApi {
+
+    /** Modelo escolhido em Ajustes primeiro; os outros só entram se ele estiver sobrecarregado/sem cota. */
+    private val models = (listOf(model) + fallbackModels).distinct()
+
+    /** Modelo em uso agora (índice em [models]) e desde quando, para voltar ao principal depois. */
+    @Volatile private var activeIndex = 0
+    @Volatile private var activeSince = 0L
 
     /** Se o modelo recusar o thinkingConfig, as próximas chamadas vão sem ele. */
     @Volatile private var sendThinking = true
+
+    /** Modelo que respondeu a última chamada (para testes/diagnóstico). */
+    val currentModel: String get() = models[activeIndex]
 
     override suspend fun createMessage(
         system: String,
@@ -40,17 +54,58 @@ class GeminiClient(
         if (apiKey.isBlank()) {
             throw ClaudeException("Chave do Gemini não configurada. Abra Ajustes e cole sua chave do Google AI Studio.")
         }
-        try {
-            stream(system, messages, tools, onTextDelta, thinking = sendThinking)
-        } catch (e: ThinkingNotSupported) {
-            sendThinking = false
-            stream(system, messages, tools, onTextDelta, thinking = false)
+        // Depois de um tempo num modelo reserva, tenta o principal de novo.
+        if (activeIndex != 0 && clock() - activeSince > RETURN_TO_PRIMARY_MS) activeIndex = 0
+
+        var lastError: Unavailable? = null
+        var index = activeIndex
+        while (index < models.size) {
+            val model = models[index]
+            var attempt = 0
+            while (true) {
+                try {
+                    val result = withThinkingFallback(model, system, messages, tools, onTextDelta)
+                    if (index != activeIndex) {
+                        activeIndex = index
+                        activeSince = clock()
+                    }
+                    return@withContext result
+                } catch (e: Unavailable) {
+                    lastError = e
+                    // Sobrecarga costuma passar em segundos: uma nova tentativa no mesmo modelo antes de trocar.
+                    if (e.retrySameModel && attempt == 0) {
+                        attempt++
+                        delay(retryDelayMs)
+                        continue
+                    }
+                    break
+                }
+            }
+            index++
         }
+        throw ClaudeException(lastError?.userMessage ?: "O Gemini não respondeu. Tente de novo.")
+    }
+
+    private suspend fun withThinkingFallback(
+        model: String,
+        system: String,
+        messages: JSONArray,
+        tools: JSONArray?,
+        onTextDelta: suspend (String) -> Unit,
+    ): ClaudeResponse = try {
+        stream(model, system, messages, tools, onTextDelta, thinking = sendThinking)
+    } catch (e: ThinkingNotSupported) {
+        sendThinking = false
+        stream(model, system, messages, tools, onTextDelta, thinking = false)
     }
 
     private class ThinkingNotSupported : Exception()
 
+    /** Falha que vale a pena contornar trocando de modelo (sobrecarga, cota, modelo reserva inexistente). */
+    private class Unavailable(val userMessage: String, val retrySameModel: Boolean) : Exception(userMessage)
+
     private suspend fun stream(
+        model: String,
         system: String,
         messages: JSONArray,
         tools: JSONArray?,
@@ -74,10 +129,20 @@ class GeminiClient(
                     val raw = resp.body.string()
                     val err = runCatching { JSONObject(raw).optJSONObject("error") }.getOrNull()
                     val message = err?.optString("message").orEmpty()
+                    val status = err?.optString("status").orEmpty()
                     if (resp.code == 400 && thinking && message.contains("thinking", ignoreCase = true)) {
                         throw ThinkingNotSupported()
                     }
-                    throw ClaudeException(errorMessage(resp.code, err?.optString("status").orEmpty(), message))
+                    val friendly = errorMessage(resp.code, status, message)
+                    when {
+                        resp.code == 503 || resp.code == 500 || status == "UNAVAILABLE" || status == "INTERNAL" ->
+                            throw Unavailable(friendly, retrySameModel = true)
+                        // Cota gratuita é por modelo: outro modelo ainda pode ter.
+                        resp.code == 429 || status == "RESOURCE_EXHAUSTED" -> throw Unavailable(friendly, retrySameModel = false)
+                        // Um modelo reserva que não existe mais não pode travar o app.
+                        resp.code == 404 && model != models.first() -> throw Unavailable(friendly, retrySameModel = false)
+                    }
+                    throw ClaudeException(friendly)
                 }
 
                 val acc = GeminiStreamAccumulator()
@@ -107,11 +172,17 @@ class GeminiClient(
 
     companion object {
         private const val BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+        private const val RETURN_TO_PRIMARY_MS = 10 * 60 * 1000L
+
+        /** Modelos Flash com plano gratuito, do mais capaz ao mais leve. */
+        val DEFAULT_FALLBACKS = listOf("gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite")
         private val JSON = "application/json".toMediaType()
 
         internal fun errorMessage(code: Int, status: String, message: String): String = when {
             code == 429 || status == "RESOURCE_EXHAUSTED" ->
                 "Limite gratuito do Gemini atingido por agora. Espere um pouco e tente de novo."
+            code == 503 || code == 500 || status == "UNAVAILABLE" || status == "INTERNAL" ->
+                "Os servidores do Gemini estão sobrecarregados agora. Tente de novo em instantes."
             code == 400 && message.contains("API key", ignoreCase = true) ->
                 "Chave do Gemini inválida. Confira em Ajustes."
             code == 403 -> "O Gemini recusou a chave (HTTP 403)${if (message.isNotBlank()) ": $message" else "."}"
