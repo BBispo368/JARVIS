@@ -143,6 +143,51 @@ class OpenAppTest(unittest.TestCase):
             self.assertEqual(ja.discover_installed_apps(), {})
 
 
+class WindowsToolTest(unittest.TestCase):
+    WINDOWS = [
+        ja.Window(1, "YouTube - Google Chrome", "chrome"),
+        ja.Window(2, "Gmail - Google Chrome", "chrome"),
+        ja.Window(3, "Spotify Premium", "spotify"),
+        ja.Window(4, "Relatório Final.docx - Word", "winword"),
+    ]
+
+    def run_tool(self, **inp):
+        actions = []
+        with mock.patch.object(ja, "list_windows", return_value=self.WINDOWS), \
+             mock.patch.object(ja, "window_action", side_effect=lambda w, a: actions.append((w.handle, a))):
+            result = ja.tool_window(inp)
+        return result, actions
+
+    def test_fecha_pelo_nome_do_programa(self):
+        result, actions = self.run_tool(name="spotify", action="close", all_matches=False)
+        self.assertEqual(actions, [(3, "close")])
+        self.assertIn("Fechei 1", result)
+
+    def test_titulo_com_acento_e_parcial(self):
+        _, actions = self.run_tool(name="relatorio", action="minimize", all_matches=False)
+        self.assertEqual(actions, [(4, "minimize")])
+
+    def test_varias_janelas_pede_confirmacao_para_fechar(self):
+        with self.assertRaises(ja.ToolError) as ctx:
+            self.run_tool(name="chrome", action="close", all_matches=False)
+        self.assertIn("2 janelas", str(ctx.exception))
+        _, actions = self.run_tool(name="chrome", action="close", all_matches=True)
+        self.assertEqual(actions, [(1, "close"), (2, "close")])
+        _, actions = self.run_tool(name="gmail", action="close", all_matches=False)
+        self.assertEqual(actions, [(2, "close")])
+
+    def test_sem_janela_lista_as_abertas(self):
+        with self.assertRaises(ja.ToolError) as ctx:
+            self.run_tool(name="photoshop", action="close", all_matches=False)
+        self.assertIn("spotify", str(ctx.exception))
+
+    def test_listar(self):
+        with mock.patch.object(ja, "list_windows", return_value=self.WINDOWS):
+            out = ja.tool_list_windows({})
+        self.assertIn("4 janelas", out)
+        self.assertIn("Spotify Premium (spotify)", out)
+
+
 class DiscoveryTest(unittest.TestCase):
     def test_responde_ao_broadcast_sem_vazar_token(self):
         import socket

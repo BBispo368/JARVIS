@@ -164,6 +164,8 @@ Se você trocar o `CLAUDE_MODEL` por um modelo antigo que não aceite `effort` o
 | PC | `pc_open_app` | "abre o Spotify", "abre a calculadora" (qualquer programa instalado) |
 | PC | `pc_run_shortcut` | "qual meu IP público?" (só atalhos do `config.json`) |
 | PC | `pc_media` | "pausa a música", "aumenta o volume" |
+| PC | `pc_list_windows` | "o que está aberto no PC?" |
+| PC | `pc_window` | "fecha o Chrome", "minimiza o Spotify", "traz o Word pra frente" |
 | PC | `pc_lock_screen` | "bloqueia o computador" |
 | PC | `pc_clipboard` | "copia esse texto pro PC: ..." |
 | PC | `pc_system_status` | "quanto de disco sobrou no PC?" |
@@ -240,6 +242,8 @@ Edite o `pc-agent/config.json`, usando o `config.example.json` como base, e rein
 
 Dependências opcionais por sistema:
 - **Linux**: `pactl` (volume), `playerctl` (mídia), `wl-copy`/`xclip`/`xsel` (área de transferência), `loginctl` (bloquear tela).
+- **Linux**: `wmctrl` para listar e fechar janelas.
+- **macOS**: listar e fechar janelas age por aplicativo (fechar = sair do app); o Terminal/Python pode pedir permissão de Acessibilidade.
 - **macOS**: o controle de mídia usa o Spotify (se aberto) ou o app Música; bloquear a tela usa `pmset displaysleepnow`, então ative *Exigir senha imediatamente* nos Ajustes.
 
 ### Testes

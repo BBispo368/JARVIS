@@ -395,7 +395,9 @@ def uptime_seconds() -> Optional[float]:
     try:
         if SYSTEM == "Windows":
             import ctypes  # noqa: PLC0415
-            return ctypes.windll.kernel32.GetTickCount64() / 1000
+            tick = ctypes.windll.kernel32.GetTickCount64
+            tick.restype = ctypes.c_ulonglong  # o padrão (int de 32 bits) estouraria após ~25 dias
+            return tick() / 1000
         if SYSTEM == "Linux":
             return float(Path("/proc/uptime").read_text().split()[0])
         if SYSTEM == "Darwin":
@@ -420,6 +422,204 @@ def battery_percent() -> Optional[str]:
     except Exception:  # noqa: BLE001
         return None
     return None
+
+
+# --------------------------------------------------------------------------
+# Janelas abertas (listar, fechar, minimizar, maximizar, focar)
+# --------------------------------------------------------------------------
+
+@dataclass
+class Window:
+    handle: Any          # HWND no Windows; id do wmctrl no Linux; nome do app no macOS
+    title: str
+    process: str         # ex.: "chrome", "spotify"
+
+
+WINDOW_ACTIONS = ["close", "minimize", "maximize", "focus"]
+_SKIP_TITLES = {"program manager", "configuracoes", "settings", "windows input experience",
+                "microsoft text input application", "nvidia geforce overlay"}
+
+
+def list_windows() -> List[Window]:
+    """Janelas de aplicativo visíveis (sem barras, popups invisíveis e a área de trabalho)."""
+    if SYSTEM == "Windows":
+        return _win_list()
+    if SYSTEM == "Darwin":
+        out = run(["osascript", "-e",
+                   'tell application "System Events" to get name of every application process whose visible is true'])
+        return [Window(n.strip(), n.strip(), n.strip().lower()) for n in out.split(",") if n.strip()]
+    if not shutil.which("wmctrl"):
+        raise ToolError("preciso do 'wmctrl' instalado para mexer nas janelas neste Linux")
+    windows = []
+    for line in run(["wmctrl", "-lp"]).splitlines():
+        parts = line.split(None, 4)
+        if len(parts) == 5:
+            proc = ""
+            try:
+                proc = Path(f"/proc/{parts[2]}/comm").read_text().strip()
+            except OSError:
+                pass
+            windows.append(Window(parts[0], parts[4], proc))
+    return windows
+
+
+def window_action(win: Window, action: str) -> None:
+    if SYSTEM == "Windows":
+        _win_action(win.handle, action)
+    elif SYSTEM == "Darwin":
+        scripts = {
+            "close": f'tell application "{win.handle}" to quit',
+            "focus": f'tell application "{win.handle}" to activate',
+            "minimize": f'tell application "System Events" to set visible of process "{win.handle}" to false',
+            "maximize": f'tell application "{win.handle}" to activate',
+        }
+        run(["osascript", "-e", scripts[action]])
+    else:
+        args = {"close": ["-ic", win.handle], "focus": ["-ia", win.handle],
+                "minimize": ["-ir", win.handle, "-b", "add,hidden"],
+                "maximize": ["-ir", win.handle, "-b", "add,maximized_vert,maximized_horz"]}[action]
+        run(["wmctrl", *args])
+
+
+_WIN_API: Dict[str, Any] = {}
+
+
+def _win_api():
+    """user32/kernel32 com os tipos declarados (sem isso, ponteiros de 64 bits seriam truncados)."""
+    if _WIN_API:
+        return _WIN_API["user32"], _WIN_API["kernel32"]
+    import ctypes  # noqa: PLC0415
+    from ctypes import wintypes as w  # noqa: PLC0415
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    protos = [
+        (user32.IsWindowVisible, [w.HWND], w.BOOL),
+        (user32.GetWindow, [w.HWND, w.UINT], w.HWND),
+        (user32.GetWindowLongW, [w.HWND, ctypes.c_int], w.LONG),
+        (user32.GetWindowTextLengthW, [w.HWND], ctypes.c_int),
+        (user32.GetWindowTextW, [w.HWND, w.LPWSTR, ctypes.c_int], ctypes.c_int),
+        (user32.GetWindowThreadProcessId, [w.HWND, ctypes.POINTER(w.DWORD)], w.DWORD),
+        (user32.PostMessageW, [w.HWND, w.UINT, w.WPARAM, w.LPARAM], w.BOOL),
+        (user32.ShowWindow, [w.HWND, ctypes.c_int], w.BOOL),
+        (user32.IsIconic, [w.HWND], w.BOOL),
+        (user32.SetForegroundWindow, [w.HWND], w.BOOL),
+        (kernel32.OpenProcess, [w.DWORD, w.BOOL, w.DWORD], w.HANDLE),
+        (kernel32.QueryFullProcessImageNameW, [w.HANDLE, w.DWORD, w.LPWSTR, ctypes.POINTER(w.DWORD)], w.BOOL),
+        (kernel32.CloseHandle, [w.HANDLE], w.BOOL),
+    ]
+    for fn, args, res in protos:
+        fn.argtypes, fn.restype = args, res
+    _WIN_API.update(user32=user32, kernel32=kernel32)
+    return user32, kernel32
+
+
+def _win_list() -> List[Window]:
+    import ctypes  # noqa: PLC0415
+    from ctypes import wintypes  # noqa: PLC0415
+
+    user32, kernel32 = _win_api()
+    GW_OWNER, GWL_EXSTYLE, WS_EX_TOOLWINDOW = 4, -20, 0x00000080
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    found: List[Window] = []
+
+    def process_name(hwnd) -> str:
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(len(buf))
+            if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return Path(buf.value).stem.lower()
+            return ""
+        finally:
+            kernel32.CloseHandle(h)
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def callback(hwnd, _):
+        if not user32.IsWindowVisible(hwnd) or user32.GetWindow(hwnd, GW_OWNER):
+            return True
+        if user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW:
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value.strip()
+        if title and normalize(title) not in _SKIP_TITLES:
+            found.append(Window(hwnd, title, process_name(hwnd)))
+        return True
+
+    user32.EnumWindows(callback, 0)  # o callback já tem o protótipo certo (WINFUNCTYPE)
+    return found
+
+
+def _win_action(hwnd, action: str) -> None:
+    user32, _ = _win_api()
+    WM_CLOSE, SW_MINIMIZE, SW_MAXIMIZE, SW_RESTORE = 0x0010, 6, 3, 9
+    if action == "close":
+        # Mesmo efeito do "X": o programa ainda pode perguntar se quer salvar.
+        user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+    elif action == "minimize":
+        user32.ShowWindow(hwnd, SW_MINIMIZE)
+    elif action == "maximize":
+        user32.ShowWindow(hwnd, SW_MAXIMIZE)
+    elif action == "focus":
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.SetForegroundWindow(hwnd)
+
+
+def match_windows(query: str, windows: List[Window]) -> List[Window]:
+    """Janelas cujo título ou programa combinam com o pedido ('chrome', 'spotify', 'relatório.docx')."""
+    q = normalize(query)
+    if not q:
+        return []
+    tokens = q.split()
+    hits = []
+    for w in windows:
+        hay = normalize(f"{w.title} {w.process}")
+        if q in hay or all(t in hay.split() for t in tokens):
+            hits.append(w)
+    return hits
+
+
+def tool_list_windows(_: Dict[str, Any]) -> str:
+    windows = list_windows()
+    if not windows:
+        return "Nenhuma janela aberta."
+    lines = [f"- {w.title} ({w.process})" if w.process else f"- {w.title}" for w in windows[:40]]
+    return f"{len(windows)} janelas abertas:\n" + "\n".join(lines)
+
+
+ACTION_PT = {"close": "Fechei", "minimize": "Minimizei", "maximize": "Maximizei", "focus": "Trouxe para a frente"}
+
+
+def tool_window(inp: Dict[str, Any]) -> str:
+    action = str(inp.get("action", ""))
+    if action not in WINDOW_ACTIONS:
+        raise ToolError(f"ação inválida: {action}")
+    query = str(inp.get("name", "")).strip()
+    apply_all = bool(inp.get("all_matches", False))
+    windows = list_windows()
+    hits = match_windows(query, windows)
+    if not hits:
+        names = ", ".join(sorted({w.process or w.title for w in windows})[:20])
+        raise ToolError(f"nenhuma janela aberta combina com '{query}'. Abertas: {names or 'nenhuma'}")
+    if len(hits) > 1 and not apply_all and action != "close":
+        hits = hits[:1]  # minimizar/focar várias de uma vez raramente é o desejado
+    if len(hits) > 1 and not apply_all:
+        titles = "; ".join(w.title for w in hits[:8])
+        raise ToolError(f"há {len(hits)} janelas que combinam: {titles}. Chame de novo com um nome mais "
+                        "específico, ou com all_matches=true para fechar todas.")
+    for w in hits:
+        window_action(w, action)
+    verb = ACTION_PT[action]
+    return f"{verb} {len(hits)} janela(s): " + "; ".join(w.title for w in hits[:8]) + "."
 
 
 def tool_system_status(_: Dict[str, Any]) -> str:
@@ -475,6 +675,28 @@ def build_tools(cfg: Dict[str, Any]) -> Dict[str, Tool]:
             "Informa o estado do computador: sistema, disco livre, tempo ligado, bateria e hora.",
             obj_schema({}),
             tool_system_status,
+        ),
+        Tool(
+            "pc_list_windows", "Vendo as janelas do PC",
+            "Lista as janelas abertas no computador (título e programa). Use antes de fechar/minimizar "
+            "quando não tiver certeza do nome.",
+            obj_schema({}),
+            tool_list_windows,
+        ),
+        Tool(
+            "pc_window", "Mexendo nas janelas do PC",
+            "Fecha, minimiza, maximiza ou traz para a frente janelas abertas no computador, pelo nome do "
+            "programa ou parte do título (ex.: 'chrome', 'spotify', 'relatório'). Fechar equivale a clicar "
+            "no X: o programa pode pedir para salvar. Se várias janelas combinarem, fechar exige "
+            "all_matches=true ou um nome mais específico.",
+            obj_schema({
+                "name": {"type": "string", "description": "Programa ou parte do título da janela"},
+                "action": {"type": "string", "enum": WINDOW_ACTIONS,
+                           "description": "close, minimize, maximize ou focus"},
+                "all_matches": {"type": "boolean",
+                                "description": "true para aplicar em todas as janelas que combinarem"},
+            }),
+            tool_window,
         ),
     ]
 
